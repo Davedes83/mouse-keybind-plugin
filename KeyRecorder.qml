@@ -3,223 +3,171 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import qs.Commons
 import qs.Ui
+import "Model.js" as Model
 
 // Interactive Keybinding Recorder
-// Supports live keyboard listening, modifier toggle pills, quick key buttons, and real-time conflict checking
+//
+// The modifier pills (modSuper/modCtrl/modAlt/modShift) and `mainKey` are the
+// source of truth. `value` is always derived from them via composeKey();
+// setting `value` from outside re-parses it into the pills exactly once.
+//
+// Recording never clears the current chord: modifier-only key presses toggle
+// their pill, a main key ORs the held modifiers into the pills, sets the key
+// and stops recording. Super chords are grabbed by Hyprland before this window
+// sees them, so the SUPER pill can be toggled by hand and the key typed.
 Item {
   id: root
 
   property string value: ""
   property bool recording: false
-  property string previousValueBeforeRecord: ""
   property color foreground: Color.foreground
   property color background: Color.background
   property color accent: Color.accent
   property color urgent: Color.urgent
 
-  // Modifier state flags
+  // Modifier state flags + main key (source of truth)
   property bool modSuper: false
   property bool modCtrl: false
   property bool modAlt: false
   property bool modShift: false
   property string mainKey: ""
 
+  readonly property bool complete: root.mainKey.length > 0
+  readonly property bool hasModifier: root.modSuper || root.modCtrl || root.modAlt || root.modShift
+  readonly property bool incomplete: !root.complete && root.hasModifier
+
   signal keyChanged(string newKey)
 
-  // List of all active bindings for real-time collision detection
+  // All active bindings for instant local collision feedback
   property var allBindings: []
-  property string currentDescription: ""
+  // Snapshot identity of the binding being edited (set once at open time) so
+  // the binding never conflicts with itself even after its title is edited.
+  property string ownId: ""
+  property string ownDescription: ""
+  property string ownKey: ""
+
+  // Banner text supplied by the parent (backend `check` result); when empty
+  // the local collision list is used.
+  property string conflictMessage: ""
+  // Parent turns this off once it has a fresh backend answer for the chord.
+  property bool localConflictEnabled: true
 
   readonly property var activeConflict: checkConflict(root.value)
-  readonly property bool hasConflict: activeConflict !== null
+  readonly property bool hasLocalConflict: root.localConflictEnabled && activeConflict !== null
+  readonly property bool hasConflict: root.hasLocalConflict || root.conflictMessage.length > 0
+
+  // Internal guards
+  property bool _composing: false
+  property bool _syncingField: false
+  property var _preRecord: null
 
   onValueChanged: {
-    if (!root.recording) {
-      parseCurrentValue(root.value)
-    }
+    if (root._composing) return
+    parseCurrentValue(root.value)
+  }
+
+  onMainKeyChanged: {
+    if (root._syncingField) return
+    root._syncingField = true
+    if (manualKeyField.text.trim() !== root.mainKey) manualKeyField.text = root.mainKey
+    root._syncingField = false
   }
 
   function parseCurrentValue(str) {
-    if (!str) {
-      root.modSuper = false
-      root.modCtrl = false
-      root.modAlt = false
-      root.modShift = false
-      root.mainKey = ""
-      return
-    }
+    var p = Model.parseChord(str)
+    root.modSuper = p.modSuper
+    root.modCtrl = p.modCtrl
+    root.modAlt = p.modAlt
+    root.modShift = p.modShift
+    root.mainKey = p.mainKey
+  }
 
-    var raw = String(str).replace(/,/g, "+").split("+")
-    var superOn = false
-    var ctrlOn = false
-    var altOn = false
-    var shiftOn = false
-    var key = ""
-
-    for (var i = 0; i < raw.length; i++) {
-      var p = raw[i].trim()
-      var u = p.toUpperCase()
-      if (u === "SUPER" || u === "WIN" || u === "META" || u === "MOD4") superOn = true
-      else if (u === "CTRL" || u === "CONTROL") ctrlOn = true
-      else if (u === "ALT" || u === "MOD1") altOn = true
-      else if (u === "SHIFT") shiftOn = true
-      else if (p.length > 0) key = p
-    }
-
-    root.modSuper = superOn
-    root.modCtrl = ctrlOn
-    root.modAlt = altOn
-    root.modShift = shiftOn
-    root.mainKey = key
+  // Load a chord from outside (dialog open, suggestion chip): sets value and
+  // re-parses it into the pills even when the string is unchanged.
+  function load(chord) {
+    var v = chord ? String(chord) : ""
+    root._composing = true
+    root.value = v
+    root._composing = false
+    parseCurrentValue(v)
   }
 
   function composeKey() {
-    var mods = []
-    if (root.modSuper) mods.push("SUPER")
-    if (root.modShift) mods.push("SHIFT")
-    if (root.modCtrl) mods.push("CTRL")
-    if (root.modAlt) mods.push("ALT")
-
-    var result = ""
-    if (mods.length > 0 && root.mainKey) {
-      result = mods.join(" + ") + " + " + root.mainKey
-    } else if (mods.length > 0 && !root.mainKey) {
-      result = mods.join(" + ")
-    } else {
-      result = root.mainKey
-    }
-
+    var result = Model.composeChord(root.modSuper, root.modShift, root.modCtrl, root.modAlt, root.mainKey)
+    root._composing = true
     root.value = result
+    root._composing = false
     root.keyChanged(result)
     return result
   }
 
-  function normalizeKey(keyChord) {
-    if (!keyChord) return ""
-    var raw = String(keyChord).replace(/,/g, "+").split("+")
-    var mods = []
-    var key = ""
-    var order = { "SUPER": 1, "SHIFT": 2, "CTRL": 3, "CONTROL": 3, "ALT": 4 }
-
-    for (var i = 0; i < raw.length; i++) {
-      var p = raw[i].trim()
-      var u = p.toUpperCase()
-      if (u === "SUPER" || u === "WIN" || u === "META" || u === "MOD4") {
-        if (mods.indexOf("SUPER") === -1) mods.push("SUPER")
-      } else if (u === "SHIFT") {
-        if (mods.indexOf("SHIFT") === -1) mods.push("SHIFT")
-      } else if (u === "CTRL" || u === "CONTROL") {
-        if (mods.indexOf("CTRL") === -1) mods.push("CTRL")
-      } else if (u === "ALT" || u === "MOD1") {
-        if (mods.indexOf("ALT") === -1) mods.push("ALT")
-      } else if (p.length > 0) {
-        key = p
-      }
-    }
-
-    mods.sort(function(a, b) { return (order[a] || 99) - (order[b] || 99) })
-
-    if (key) {
-      var uKey = key.toUpperCase()
-      if (uKey === "RETURN" || uKey === "ENTER" || uKey === "SPACE" || uKey === "ESCAPE"
-          || uKey === "TAB" || uKey === "BACKSPACE" || uKey === "DELETE" || uKey === "PRINT"
-          || uKey === "LEFT" || uKey === "RIGHT" || uKey === "UP" || uKey === "DOWN"
-          || (uKey.charAt(0) === "F" && !isNaN(parseInt(uKey.substring(1))))) {
-        key = uKey
-      } else if (key.length === 1 && !isNaN(parseInt(key))) {
-        key = key
-      } else if (key.length === 1) {
-        key = key.toUpperCase()
-      }
-    }
-
-    if (mods.length > 0 && key) return mods.join(" + ") + " + " + key
-    if (mods.length > 0 && !key) return mods.join(" + ")
-    return key
-  }
-
   function checkConflict(key) {
     if (!key || !root.allBindings || root.allBindings.length === 0) return null
-    var target = normalizeKey(key)
+    var target = Model.normalizeKey(key)
     if (!target) return null
-
+    var ownNorm = Model.normalizeKey(root.ownKey)
+    var holders = Model.holdersOf(root.allBindings, target, root.ownId)
     var collisions = []
-    for (var i = 0; i < root.allBindings.length; i++) {
-      var b = root.allBindings[i]
-      if (b.status === "disabled" || b.is_mouse) continue
-      if (normalizeKey(b.key) === target) {
-        if (root.currentDescription && b.description === root.currentDescription) continue
-        collisions.push(b)
-      }
+    for (var i = 0; i < holders.length; i++) {
+      var b = holders[i]
+      if (root.ownDescription && b.description === root.ownDescription && ownNorm && Model.normalizeKey(b.key) === ownNorm) continue
+      collisions.push(b)
     }
-
     return collisions.length > 0 ? collisions : null
   }
 
   function startRecording() {
-    root.previousValueBeforeRecord = root.value
-    // Reset all modifier states cleanly for the new recording session
+    root._preRecord = {
+      modSuper: root.modSuper, modCtrl: root.modCtrl, modAlt: root.modAlt, modShift: root.modShift,
+      mainKey: root.mainKey, value: root.value
+    }
+    root.recording = true
+    keyCaptureFocus.forceActiveFocus()
+  }
+
+  function restorePreRecord() {
+    var s = root._preRecord
+    if (!s) return
+    root.modSuper = s.modSuper
+    root.modCtrl = s.modCtrl
+    root.modAlt = s.modAlt
+    root.modShift = s.modShift
+    root.mainKey = s.mainKey
+    root.composeKey()
+  }
+
+  // Done / click-away: keeps what was captured, unless no main key was picked.
+  function stopRecording() {
+    if (!root.recording) return
+    root.recording = false
+    if (!root.mainKey) restorePreRecord()
+    root._preRecord = null
+  }
+
+  // Escape: discard everything captured during this recording session.
+  function cancelRecording() {
+    if (!root.recording) return
+    root.recording = false
+    restorePreRecord()
+    root._preRecord = null
+  }
+
+  function clearAll() {
+    root.recording = false
+    root._preRecord = null
     root.modSuper = false
     root.modCtrl = false
     root.modAlt = false
     root.modShift = false
     root.mainKey = ""
-    root.recording = true
-    keyCaptureFocus.forceActiveFocus()
+    root.composeKey()
   }
 
-  function stopRecording() {
+  function pickMainKey(name) {
+    root.mainKey = name
     root.recording = false
-    if (!root.value && root.previousValueBeforeRecord) {
-      root.value = root.previousValueBeforeRecord
-      parseCurrentValue(root.value)
-    }
-  }
-
-  function translateQtKey(event) {
-    var key = event.key
-    var text = event.text
-
-    if (key === Qt.Key_Return || key === Qt.Key_Enter) return "RETURN"
-    if (key === Qt.Key_Space) return "SPACE"
-    if (key === Qt.Key_Escape) return "ESCAPE"
-    if (key === Qt.Key_Tab || key === Qt.Key_Backtab) return "TAB"
-    if (key === Qt.Key_Backspace) return "BACKSPACE"
-    if (key === Qt.Key_Delete) return "DELETE"
-    if (key === Qt.Key_Print) return "PRINT"
-    if (key === Qt.Key_Left) return "LEFT"
-    if (key === Qt.Key_Right) return "RIGHT"
-    if (key === Qt.Key_Up) return "UP"
-    if (key === Qt.Key_Down) return "DOWN"
-    if (key === Qt.Key_Comma) return "comma"
-    if (key === Qt.Key_Period) return "period"
-    if (key === Qt.Key_Slash) return "slash"
-    if (key === Qt.Key_Minus) return "minus"
-    if (key === Qt.Key_Equal) return "equal"
-    if (key === Qt.Key_BracketLeft) return "bracketleft"
-    if (key === Qt.Key_BracketRight) return "bracketright"
-    if (key === Qt.Key_PageUp) return "Page_Up"
-    if (key === Qt.Key_PageDown) return "Page_Down"
-    if (key === Qt.Key_Home) return "Home"
-    if (key === Qt.Key_End) return "End"
-
-    if (key >= Qt.Key_F1 && key <= Qt.Key_F12) {
-      return "F" + (key - Qt.Key_F1 + 1)
-    }
-
-    if (key >= Qt.Key_0 && key <= Qt.Key_9) {
-      return String.fromCharCode(key)
-    }
-
-    if (key >= Qt.Key_A && key <= Qt.Key_Z) {
-      return String.fromCharCode(key)
-    }
-
-    if (text && text.length === 1 && text.charCodeAt(0) >= 33 && text.charCodeAt(0) <= 126) {
-      return text.toUpperCase()
-    }
-
-    return ""
+    root._preRecord = null
+    root.composeKey()
   }
 
   implicitWidth: containerLayout.implicitWidth
@@ -230,7 +178,7 @@ Item {
     width: parent.width
     spacing: Style.space(12)
 
-    // 1. Sleek Key Display & Recording Box
+    // 1. Key Display & Recording Box
     BorderSurface {
       id: box
       Layout.fillWidth: true
@@ -240,10 +188,10 @@ Item {
         ? Util.alpha(root.accent, 0.12)
         : (boxMouse.containsMouse ? Util.alpha(root.foreground, 0.06) : Util.alpha(root.foreground, 0.03))
       borderSpec: Border.flat(
-        root.hasConflict
+        (root.hasConflict || root.incomplete)
           ? root.urgent
           : (root.recording ? root.accent : (boxMouse.containsMouse ? Util.alpha(root.foreground, 0.3) : Util.alpha(root.foreground, 0.15))),
-        root.recording ? 1.5 : 1
+        (root.recording || root.incomplete) ? 1.5 : 1
       )
 
       MouseArea {
@@ -263,29 +211,27 @@ Item {
         anchors.rightMargin: Style.space(16)
         spacing: Style.space(14)
 
-        // Keyboard Icon
         Text {
-          text: ""
-          color: root.recording ? root.accent : (root.hasConflict ? root.urgent : "white")
+          text: ""
+          color: root.recording ? root.accent : ((root.hasConflict || root.incomplete) ? root.urgent : root.foreground)
           font.family: Style.font.family
           font.pixelSize: Style.font.title + 2
         }
 
-        // Live badge or recording indicator
         Item {
           Layout.fillWidth: true
           Layout.fillHeight: true
 
-          // Recording mode
+          // Recording mode: live chord + listening indicator
           RowLayout {
             visible: root.recording
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(10)
 
             Rectangle {
-              width: Style.space(10)
-              height: Style.space(10)
-              radius: width / 2
+              implicitWidth: Style.space(10)
+              implicitHeight: Style.space(10)
+              radius: implicitWidth / 2
               color: root.accent
 
               SequentialAnimation on opacity {
@@ -296,11 +242,18 @@ Item {
               }
             }
 
+            KeyBadge {
+              visible: root.value.length > 0
+              keyText: root.value
+              fontSize: Style.font.body
+              accent: root.accent
+            }
+
             Text {
-              text: "Listening for keys... Press combination (e.g. CTRL + O)"
+              text: root.value.length > 0 ? "Listening… press the key (modifiers toggle)" : "Listening… press a combination (e.g. CTRL + O)"
               color: root.accent
               font.family: Style.font.family
-              font.pixelSize: Style.font.body
+              font.pixelSize: Style.font.caption
               font.bold: true
             }
           }
@@ -317,20 +270,56 @@ Item {
               highlighted: root.hasConflict
               accent: root.hasConflict ? root.urgent : root.accent
             }
+
+            // "chord incomplete" badge
+            Text {
+              visible: root.incomplete
+              text: "+"
+              color: Util.alpha(root.foreground, 0.4)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+              font.bold: true
+            }
+
+            BorderSurface {
+              visible: root.incomplete
+              implicitHeight: Style.space(24)
+              implicitWidth: incompleteLabel.implicitWidth + Style.space(12)
+              radius: Style.cornerRadius
+              color: Util.alpha(root.urgent, 0.15)
+              borderSpec: Border.flat(root.urgent, 1)
+
+              Text {
+                id: incompleteLabel
+                anchors.centerIn: parent
+                text: "?"
+                color: root.urgent
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+                font.bold: true
+              }
+            }
+
+            Text {
+              visible: root.incomplete
+              text: "Pick a key to complete the chord"
+              color: root.urgent
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
           }
 
           // Empty state
           Text {
             visible: !root.recording && root.value.length === 0
             anchors.verticalCenter: parent.verticalCenter
-            text: "Click Record or select modifier pills below..."
+            text: "Click Record, toggle modifier pills, or type a key below…"
             color: Util.alpha(root.foreground, 0.45)
             font.family: Style.font.family
             font.pixelSize: Style.font.body
           }
         }
 
-        // Action Buttons
         RowLayout {
           spacing: Style.space(8)
 
@@ -353,22 +342,24 @@ Item {
             tooltipText: "Clear shortcut"
             horizontalPadding: Style.space(10)
             verticalPadding: Style.space(6)
-            onClicked: {
-              root.value = ""
-              root.modSuper = false
-              root.modCtrl = false
-              root.modAlt = false
-              root.modShift = false
-              root.mainKey = ""
-              root.keyChanged("")
-              root.stopRecording()
-            }
+            onClicked: root.clearAll()
           }
         }
       }
     }
 
-    // 2. Modifier Toggle Buttons & Key Field
+    // Super hint
+    Text {
+      visible: root.modSuper
+      Layout.fillWidth: true
+      text: "Super chords are grabbed by Hyprland before this window sees them — toggle Super here and press or type the key."
+      color: Util.alpha(root.foreground, 0.65)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.WordWrap
+    }
+
+    // 2. Modifier Toggle Pills & Key Field
     RowLayout {
       Layout.fillWidth: true
       spacing: Style.space(8)
@@ -443,12 +434,23 @@ Item {
         id: manualKeyField
         Layout.preferredWidth: Style.space(110)
         maximumLength: 64
-        text: root.mainKey
         placeholderText: "e.g. A, TAB"
+        // One-way sync from mainKey happens in root.onMainKeyChanged; typing
+        // here pushes into mainKey (guarded so neither side loops).
         onTextChanged: {
-          if (root.mainKey !== text.trim()) {
-            root.mainKey = text.trim()
+          if (root._syncingField) return
+          var t = text.trim()
+          if (root.mainKey !== t) {
+            root._syncingField = true
+            root.mainKey = t
+            root._syncingField = false
             root.composeKey()
+          }
+        }
+        onActiveFocusChanged: {
+          if (activeFocus && root.recording) {
+            root.recording = false
+            root._preRecord = null
           }
         }
       }
@@ -465,43 +467,37 @@ Item {
         BorderSurface {
           id: quickKeyChip
           required property string modelData
+          readonly property bool isPicked: root.mainKey.toUpperCase() === modelData
           height: Style.space(26)
           width: chipTxt.implicitWidth + Style.space(16)
           radius: Style.cornerRadius
-          color: root.mainKey.toUpperCase() === modelData
+          color: isPicked
             ? Util.alpha(root.accent, 0.22)
             : (chipMouse.containsMouse ? Util.alpha(root.foreground, 0.1) : Util.alpha(root.foreground, 0.04))
-          borderSpec: Border.flat(
-            root.mainKey.toUpperCase() === modelData ? root.accent : Util.alpha(root.foreground, 0.15),
-            1
-          )
+          borderSpec: Border.flat(isPicked ? root.accent : Util.alpha(root.foreground, 0.15), 1)
 
           MouseArea {
             id: chipMouse
             anchors.fill: parent
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
-            onClicked: {
-              root.mainKey = quickKeyChip.modelData
-              manualKeyField.text = quickKeyChip.modelData
-              root.composeKey()
-            }
+            onClicked: root.pickMainKey(quickKeyChip.modelData)
           }
 
           Text {
             id: chipTxt
             anchors.centerIn: parent
             text: quickKeyChip.modelData
-            color: root.mainKey.toUpperCase() === quickKeyChip.modelData ? root.accent : root.foreground
+            color: quickKeyChip.isPicked ? root.accent : root.foreground
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
-            font.bold: root.mainKey.toUpperCase() === quickKeyChip.modelData
+            font.bold: quickKeyChip.isPicked
           }
         }
       }
     }
 
-    // 4. Conflict Alert Banner with proper internal margin
+    // 4. Conflict Alert Banner
     BorderSurface {
       id: conflictCard
       visible: root.hasConflict
@@ -534,7 +530,7 @@ Item {
             spacing: Style.space(2)
 
             Text {
-              text: "Shortcut Collision Detected"
+              text: "Shortcut already in use"
               color: root.urgent
               font.family: Style.font.family
               font.pixelSize: Style.font.body
@@ -545,12 +541,13 @@ Item {
               textFormat: Text.PlainText
               Layout.fillWidth: true
               text: {
-                if (!root.activeConflict || root.activeConflict.length === 0) return ""
+                if (root.conflictMessage.length > 0) return root.conflictMessage
+                if (!root.hasLocalConflict || !root.activeConflict || root.activeConflict.length === 0) return ""
                 var descList = []
                 for (var i = 0; i < root.activeConflict.length; i++) {
-                  descList.push('"' + root.activeConflict[i].description + '"')
+                  descList.push(root.activeConflict[i].description)
                 }
-                return 'The shortcut ' + root.value + ' is currently bound to ' + descList.join(", ") + '. Saving will reassign this shortcut.'
+                return root.value + " is " + descList.join(", ") + "."
               }
               color: root.foreground
               font.family: Style.font.family
@@ -574,42 +571,61 @@ Item {
 
     Keys.onPressed: function(event) {
       if (!root.recording) return
-
-      var isSuper = (event.modifiers & Qt.MetaModifier) !== 0 || event.key === Qt.Key_Meta || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R
-      var isCtrl = (event.modifiers & Qt.ControlModifier) !== 0 || event.key === Qt.Key_Control
-      var isAlt = (event.modifiers & Qt.AltModifier) !== 0 || event.key === Qt.Key_Alt || event.key === Qt.Key_AltGr
-      var isShift = (event.modifiers & Qt.ShiftModifier) !== 0 || event.key === Qt.Key_Shift
-
-      // Escape alone without any modifiers cancels recording and restores previous value
-      if (event.key === Qt.Key_Escape && !isSuper && !isCtrl && !isAlt && !isShift) {
-        root.stopRecording()
+      if (event.isAutoRepeat) {
         event.accepted = true
         return
       }
 
-      // Modifier-only keypress: live update modifier pills
-      if (event.key === Qt.Key_Control || event.key === Qt.Key_Shift || event.key === Qt.Key_Alt || event.key === Qt.Key_Meta || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R) {
-        root.modSuper = isSuper
-        root.modCtrl = isCtrl
-        root.modAlt = isAlt
-        root.modShift = isShift
-        root.mainKey = ""
+      var k = event.key
+      var heldSuper = (event.modifiers & Qt.MetaModifier) !== 0
+      var heldCtrl = (event.modifiers & Qt.ControlModifier) !== 0
+      var heldAlt = (event.modifiers & Qt.AltModifier) !== 0
+      var heldShift = (event.modifiers & Qt.ShiftModifier) !== 0
+
+      // Escape alone cancels recording and restores the pre-record chord
+      if (k === Qt.Key_Escape && !heldSuper && !heldCtrl && !heldAlt && !heldShift) {
+        root.cancelRecording()
+        event.accepted = true
+        return
+      }
+
+      // Modifier-only keypress: toggle exactly that pill, keep recording
+      if (k === Qt.Key_Meta || k === Qt.Key_Super_L || k === Qt.Key_Super_R) {
+        root.modSuper = !root.modSuper
+        root.composeKey()
+        event.accepted = true
+        return
+      }
+      if (k === Qt.Key_Control) {
+        root.modCtrl = !root.modCtrl
+        root.composeKey()
+        event.accepted = true
+        return
+      }
+      if (k === Qt.Key_Alt || k === Qt.Key_AltGr) {
+        root.modAlt = !root.modAlt
+        root.composeKey()
+        event.accepted = true
+        return
+      }
+      if (k === Qt.Key_Shift) {
+        root.modShift = !root.modShift
         root.composeKey()
         event.accepted = true
         return
       }
 
-      var keyName = root.translateQtKey(event)
+      // Main key: OR the held modifiers into the pills, set the key, stop
+      var keyName = Model.translateQtKey(event)
       if (keyName.length > 0) {
-        // Strictly set the modifiers from the incoming event so old ones are not preserved
-        root.modSuper = (event.modifiers & Qt.MetaModifier) !== 0
-        root.modCtrl = (event.modifiers & Qt.ControlModifier) !== 0
-        root.modAlt = (event.modifiers & Qt.AltModifier) !== 0
-        root.modShift = (event.modifiers & Qt.ShiftModifier) !== 0
+        root.modSuper = root.modSuper || heldSuper
+        root.modCtrl = root.modCtrl || heldCtrl
+        root.modAlt = root.modAlt || heldAlt
+        root.modShift = root.modShift || heldShift
         root.mainKey = keyName
-        manualKeyField.text = keyName
-        root.composeKey()
         root.recording = false
+        root._preRecord = null
+        root.composeKey()
         event.accepted = true
       }
     }

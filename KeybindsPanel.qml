@@ -5,6 +5,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "Model.js" as Model
 
 Item {
   id: root
@@ -20,6 +21,10 @@ Item {
   readonly property color accent: Color.accent
   readonly property color urgent: Color.urgent
 
+  readonly property string backendPath: Quickshell.env("HOME") + "/.config/omarchy/plugins/davedes.mouse-keybind-settings/backend/keybinds_manager.py"
+  readonly property string settingsDir: Quickshell.env("HOME") + "/.local/state/omarchy/settings"
+  readonly property string settingsPath: root.settingsDir + "/davedes.mouse-keybind-settings.json"
+
   // State
   property var modelData: ({
     active: [],
@@ -33,11 +38,75 @@ Item {
   property bool loading: false
   property string searchQuery: ""
   property bool recordingSearch: false
-  property string currentTab: "active" // "active" | "modified" | "catalog" | "conflicts"
+  property string currentTab: "active" // "active" | "modified" | "catalog" | "conflicts" | "needskey" | "ladder"
+  // Compact labels and wrapping when the window is narrower than the full layout
+  readonly property bool narrow: window.width < Style.space(1180)
+
+  // The modifier ladder: how stock Omarchy decides between Shift, Ctrl, and Alt.
+  // Derived from /usr/share/omarchy/default/hypr/bindings/*.lua; the manual never spells it out.
+  readonly property var ladderRungs: [
+    { chord: "SUPER + key", rule: "Window and workspace verbs you use all day",
+      why: "Focus, close, fullscreen, float, group, jump to workspace, the menu, the terminal. Plus the universal clipboard on C, V, X.",
+      pairs: [["Super+W", "Close window"], ["Super+F", "Fullscreen"], ["Super+1…0", "Go to workspace"], ["Super+←→↑↓", "Focus window"]] },
+    { chord: "SUPER + SHIFT + key", rule: "On a letter: launch an app. On a nav key: move the window instead of the focus",
+      why: "Nearly all of applications.lua lives here. On arrows, numbers, and Tab, Shift flips the same verb from \"go there\" to \"take the window there\" or \"go backwards\".",
+      pairs: [["Super+Shift+B", "Browser"], ["Super+Shift+M", "Music"], ["Super+Shift+1", "Move window to workspace 1"], ["Super+Shift+←", "Swap window left"]] },
+    { chord: "SUPER + CTRL + key", rule: "System controls, panels, and toggles",
+      why: "Things you would otherwise click in the bar: Audio, Bluetooth, Display, Network, Power, Emojis, Clipboard manager, Capture, Reminder, Lock, Nightlight. Ctrl+1…9 opens the bar panels by position.",
+      pairs: [["Super+Ctrl+A", "Audio panel"], ["Super+Ctrl+V", "Clipboard manager"], ["Super+Ctrl+L", "Lock"], ["Super+Ctrl+Tab", "Former workspace"]] },
+    { chord: "SUPER + ALT + key", rule: "\"The other flavor\" of whatever it is added to",
+      why: "Alt never introduces a new idea. It picks the sibling: tmux instead of a plain terminal, the apps menu instead of the root menu, full-width instead of fullscreen, \"a little\" instead of the normal resize, group instead of focus.",
+      pairs: [["Super+Alt+Return", "Tmux (Super+Return is Terminal)"], ["Super+Alt+F", "Full width (Super+F is Fullscreen)"], ["Super+Alt+Space", "Apps menu (Super+Space is Menu)"], ["Super+Alt+-", "Resize a little (Super+- is normal)"]] },
+    { chord: "SUPER + SHIFT + ALT + key", rule: "Launcher overflow: the second app on a letter that is already taken",
+      why: "Same Shift launcher layer, Alt picks the sibling app. Every pair is a real cousin of the Shift binding.",
+      pairs: [["Shift+A / Shift+Alt+A", "ChatGPT / Grok"], ["Shift+G / Shift+Alt+G", "Signal / WhatsApp"], ["Shift+E / Shift+Alt+E", "Email / New email"], ["Shift+B / Shift+Alt+B", "Browser / Private browser"]] },
+    { chord: "SUPER + CTRL + ALT + key", rule: "Control overflow: the read-only or reset twin of a Ctrl control",
+      why: "Ctrl opens or sets something. Adding Alt shows or resets it, on the same letter.",
+      pairs: [["Ctrl+R / Ctrl+Alt+R", "Set reminder / Show reminders"], ["Ctrl+Z / Ctrl+Alt+Z", "Zoom in / Reset zoom"], ["Ctrl+B / Ctrl+Alt+B", "Bluetooth / Battery left"], ["Ctrl+D / Ctrl+Alt+D", "Display / Calendar"]] },
+    { chord: "SUPER + SHIFT + CTRL + key", rule: "Last resort: the third thing on a letter, or a destructive twin",
+      why: "Only seven bindings live here. Google Messages after Signal and WhatsApp on G. Agent after ChatGPT and Grok on A. Clear reminders next to Set and Show. Theme menu behind Menu and Background.",
+      pairs: [["Shift+Ctrl+G", "Google Messages"], ["Shift+Ctrl+R", "Clear reminders"], ["Shift+Ctrl+Space", "Theme menu"]] },
+    { chord: "ALT + TAB", rule: "No Super at all: muscle memory borrowed from Windows and Mac",
+      why: "Alt+Tab cycles windows, Ctrl+Alt+Tab cycles monitors, Ctrl+Alt+Delete closes everything, Print takes a screenshot. Shift and Alt on the XF86 media keys mean \"precise\" or \"switch device\".",
+      pairs: [] }
+  ]
+  readonly property var ladderComma: [
+    ["SUPER + comma", "Dismiss last notification", "the plain verb"],
+    ["SUPER + SHIFT + comma", "Dismiss all", "bigger scope"],
+    ["SUPER + CTRL + comma", "Toggle silencing", "a system toggle"],
+    ["SUPER + ALT + comma", "Invoke last notification", "the other flavor"],
+    ["SUPER + SHIFT + ALT + comma", "Open history", "overflow"]
+  ]
   property string currentCategory: "All"
   property string toastMessage: ""
   property bool toastVisible: false
   property string pendingEditKey: ""
+  property string pendingEditId: ""
+
+  // Conflict handling. "rehome" (default): saving onto a taken key displaces
+  // the other binding immediately and opens a mandatory rehome dialog for it.
+  // "override": displace silently. "ask": probe first and ask every time.
+  property string conflictMode: "rehome"
+  property bool settingsOpen: false
+
+  // Bindings that lost their key and still need a new one:
+  // [{ id, description, lostKey, winner, default_key, action, command }]
+  property var rehomeQueue: []
+  // Set when the queue should auto-open its next entry after the next refresh.
+  property bool rehomeAutoOpen: false
+
+  // Any backend mutator in flight. Never restart a live process: block instead.
+  readonly property bool busy: setProc.running || resetProc.running || enableProc.running || disableProc.running || migrateProc.running
+  // One-shot: move the old plugin's trailing hl.unbind/o.bind lines into the managed block.
+  property bool migrationTried: false
+
+  // In-flight save (needed to re-run with --displace or to queue a rehome)
+  property var pendingSave: null
+
+  // "ask" mode conflict card
+  property bool askOpen: false
+  property var askConflict: null
+  property bool askRemember: false
 
   readonly property var categories: [
     "All",
@@ -52,11 +121,13 @@ Item {
     closingFromHost = false
     window.visible = true
     root.pendingEditKey = ""
+    root.pendingEditId = ""
     if (payloadJson && payloadJson.trim().length > 0) {
       try {
         var payload = JSON.parse(payloadJson)
-        if (payload && typeof payload === "object" && payload.edit) {
-          root.pendingEditKey = String(payload.edit)
+        if (payload && typeof payload === "object") {
+          if (payload.edit) root.pendingEditKey = String(payload.edit)
+          if (payload.id) root.pendingEditId = String(payload.id)
         }
       } catch (e) {
         console.warn("KeybindsPanel: Failed to parse summon payload:", e)
@@ -69,16 +140,20 @@ Item {
   }
 
   onModelDataChanged: {
-    if (root.pendingEditKey && root.modelData && Array.isArray(root.modelData.active)) {
-      var target = root.pendingEditKey
+    if ((root.pendingEditKey || root.pendingEditId) && root.modelData && Array.isArray(root.modelData.active)) {
+      var targetKey = root.pendingEditKey
+      var targetId = root.pendingEditId
       root.pendingEditKey = ""
-      for (var i = 0; i < root.modelData.active.length; i++) {
-        var item = root.modelData.active[i]
-        if (item && item.key === target) {
-          editDialog.openEdit(item)
-          return
+      root.pendingEditId = ""
+      var row = targetId ? Model.findRowById(root.modelData, targetId) : null
+      if (!row && targetKey) {
+        var norm = Model.normalizeKey(targetKey)
+        for (var i = 0; i < root.modelData.active.length; i++) {
+          var item = root.modelData.active[i]
+          if (item && item.key && Model.normalizeKey(item.key) === norm) { row = item; break }
         }
       }
+      if (row) editDialog.openEdit(row)
     }
   }
 
@@ -107,191 +182,367 @@ Item {
     onTriggered: root.toastVisible = false
   }
 
-  function loadData() {
+  function focusSearch() {
+    Qt.callLater(function() {
+      if (!editDialog.opened && !root.askOpen && searchInput) searchInput.forceActiveFocus()
+    })
+  }
+
+  // ---- Persisted settings (shared file with Panel.qml; read-modify-write) ----
+
+  function applySettings(raw) {
+    try {
+      var data = JSON.parse(raw)
+      if (Util.isPlainObject(data)) {
+        var m = data.keybindConflictMode
+        if (m === "ask" || m === "rehome" || m === "override") root.conflictMode = m
+      }
+    } catch (e) { /* missing or corrupt -> keep defaults */ }
+  }
+
+  function setConflictMode(mode) {
+    if (mode !== "ask" && mode !== "rehome" && mode !== "override") return
+    root.conflictMode = mode
+    var data = {}
+    try {
+      var cur = JSON.parse(settingsFile.text())
+      if (Util.isPlainObject(cur)) data = cur
+    } catch (e) { /* start fresh */ }
+    data.keybindConflictMode = mode
+    root.writeSettings(JSON.stringify(data, null, 2) + "\n")
+  }
+
+  // Writes go through a mkdir -p first so a fresh machine (no state dir yet)
+  // still persists; the latest pending text wins if several writes queue up.
+  property string pendingSettingsText: ""
+
+  function writeSettings(text) {
+    root.pendingSettingsText = text
+    if (!settingsDirProc.running) settingsDirProc.running = true
+  }
+
+  BoundedProcess {
+    id: settingsDirProc
+    command: ["mkdir", "-p", root.settingsDir]
+    timeoutMs: 5000
+    onFinished: {
+      if (root.pendingSettingsText.length > 0) {
+        settingsFile.setText(root.pendingSettingsText)
+        root.pendingSettingsText = ""
+      }
+    }
+  }
+
+  FileView {
+    id: settingsFile
+    path: root.settingsPath
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.applySettings(text())
+    onLoadFailed: { /* file absent -> defaults */ }
+  }
+
+  Component.onCompleted: settingsDirProc.running = true
+
+  // ---- Backend calls ----
+
+  function parseResult(proc) {
+    var text = (proc.stdout || "").trim()
+    if (!text) return null
+    try {
+      var lines = text.split("\n")
+      return JSON.parse(lines[lines.length - 1])
+    } catch (e) {
+      return null
+    }
+  }
+
+  function failureText(proc, res, fallback) {
+    if (res && res.error) return String(res.error)
+    if (proc.timedOut) return "backend timed out"
+    if (proc.overflowed) return "backend output too large"
+    if (proc.startFailed) return "backend could not start"
+    var err = (proc.stderr || "").trim()
+    if (err) {
+      var errLines = err.split("\n")
+      return errLines[errLines.length - 1]
+    }
+    return fallback
+  }
+
+  function startProc(proc, args) {
+    if (proc.running) return false
+    proc.command = [root.backendPath].concat(args)
     root.loading = true
-    listProc.running = false
+    proc.running = true
+    return true
+  }
+
+  function loadData() {
+    if (listProc.running) {
+      root.reloadPending = true
+      return
+    }
+    root.reloadPending = false
+    root.loading = true
     listProc.running = true
   }
+  property bool reloadPending: false
 
-  function saveKeybinding(key, desc, cmd, action, oldKey, overrideConflict) {
-    console.log("[KB] saveKeybinding args:", JSON.stringify({ key: key, desc: desc, cmd: cmd, action: action, oldKey: oldKey }))
-    root.loading = true
-    setProc.running = false
-    setProc.command = [
-      Quickshell.env("HOME") + "/.config/omarchy/plugins/davedes.mouse-keybind-settings/backend/keybinds_manager.py",
-      "set",
-      key,
-      desc,
-      cmd,
-      action || "",
-      oldKey || ""
-    ]
-    setProc.running = true
-  }
-
-  function resetKeybinding(key, defaultKey) {
-    root.loading = true
-    resetProc.running = false
-    resetProc.command = [
-      Quickshell.env("HOME") + "/.config/omarchy/plugins/davedes.mouse-keybind-settings/backend/keybinds_manager.py",
-      "reset",
-      key,
-      defaultKey || ""
-    ]
-    resetProc.running = true
-  }
-
-  function enableKeybinding(key) {
-    root.loading = true
-    enableProc.running = false
-    enableProc.command = [
-      Quickshell.env("HOME") + "/.config/omarchy/plugins/davedes.mouse-keybind-settings/backend/keybinds_manager.py",
-      "enable",
-      key
-    ]
-    enableProc.running = true
-  }
-
-  function disableKeybinding(key) {
-    root.loading = true
-    disableProc.running = false
-    disableProc.command = [
-      Quickshell.env("HOME") + "/.config/omarchy/plugins/davedes.mouse-keybind-settings/backend/keybinds_manager.py",
-      "disable",
-      key
-    ]
-    disableProc.running = true
-  }
-
-  function translateQtKey(event) {
-    var key = event.key
-    var text = event.text
-
-    if (key === Qt.Key_Return || key === Qt.Key_Enter) return "RETURN"
-    if (key === Qt.Key_Space) return "SPACE"
-    if (key === Qt.Key_Escape) return "ESCAPE"
-    if (key === Qt.Key_Tab || key === Qt.Key_Backtab) return "TAB"
-    if (key === Qt.Key_Backspace) return "BACKSPACE"
-    if (key === Qt.Key_Delete) return "DELETE"
-    if (key === Qt.Key_Print) return "PRINT"
-    if (key === Qt.Key_Left) return "LEFT"
-    if (key === Qt.Key_Right) return "RIGHT"
-    if (key === Qt.Key_Up) return "UP"
-    if (key === Qt.Key_Down) return "DOWN"
-    if (key === Qt.Key_Comma) return "comma"
-    if (key === Qt.Key_Period) return "period"
-    if (key === Qt.Key_Slash) return "slash"
-    if (key === Qt.Key_Minus) return "minus"
-    if (key === Qt.Key_Equal) return "equal"
-    if (key === Qt.Key_BracketLeft) return "bracketleft"
-    if (key === Qt.Key_BracketRight) return "bracketright"
-    if (key === Qt.Key_PageUp) return "Page_Up"
-    if (key === Qt.Key_PageDown) return "Page_Down"
-    if (key === Qt.Key_Home) return "Home"
-    if (key === Qt.Key_End) return "End"
-
-    if (key >= Qt.Key_F1 && key <= Qt.Key_F12) {
-      return "F" + (key - Qt.Key_F1 + 1)
+  function saveKeybinding(key, desc, cmd, action, oldKey, id) {
+    if (root.busy) {
+      root.showToast("Still applying the previous change — try again in a moment")
+      return
     }
-
-    if (key >= Qt.Key_0 && key <= Qt.Key_9) {
-      return String.fromCharCode(key)
+    root.pendingSave = {
+      key: key, desc: desc, cmd: cmd, action: action || "", oldKey: oldKey || "",
+      id: id || String(desc || "").toLowerCase(), mode: root.conflictMode
     }
-
-    if (key >= Qt.Key_A && key <= Qt.Key_Z) {
-      return String.fromCharCode(key)
-    }
-
-    if (text && text.length === 1 && text.charCodeAt(0) >= 33 && text.charCodeAt(0) <= 126) {
-      return text.toUpperCase()
-    }
-
-    return ""
+    // rehome / override: displace immediately. ask: probe without --displace.
+    root.runSet(root.conflictMode !== "ask")
   }
 
-  // Filtered active bindings (sorted alphabetically)
-  readonly property var filteredActive: {
-    var list = root.modelData.active || []
-    var q = root.searchQuery.trim().toLowerCase()
-    var cat = root.currentCategory
+  function runSet(displace) {
+    var p = root.pendingSave
+    if (!p) return
+    var args = ["set", p.key, p.desc, p.cmd, p.action, p.oldKey, "--id", p.id]
+    if (displace) args.push("--displace")
+    p.displace = displace
+    root.startProc(setProc, args)
+  }
 
-    var res = []
-    for (var i = 0; i < list.length; i++) {
-      var item = list[i]
+  function resetKeybinding(key, defaultKey, id) {
+    if (root.busy) { root.showToast("Still applying the previous change — try again in a moment"); return }
+    root.startProc(resetProc, ["reset", key || "", defaultKey || "", "--id", id || ""])
+  }
 
-      // Category filter
-      if (cat !== "All" && item.category !== cat) continue
+  function enableKeybinding(key, id) {
+    if (root.busy) { root.showToast("Still applying the previous change — try again in a moment"); return }
+    root.startProc(enableProc, ["enable", key || "", "--id", id || ""])
+  }
 
-      // Search filter
-      if (q.length > 0) {
-        var matchKey = item.key && item.key.toLowerCase().indexOf(q) !== -1
-        var matchDesc = item.description && item.description.toLowerCase().indexOf(q) !== -1
-        var matchCmd = (item.command && item.command.toLowerCase().indexOf(q) !== -1) ||
-                       (item.action && item.action.toLowerCase().indexOf(q) !== -1)
-        var matchCat = item.category && item.category.toLowerCase().indexOf(q) !== -1
+  function disableKeybinding(key, id) {
+    if (root.busy) { root.showToast("Still applying the previous change — try again in a moment"); return false }
+    return root.startProc(disableProc, ["disable", key || "", "--id", id || ""])
+  }
 
-        if (!matchKey && !matchDesc && !matchCmd && !matchCat) continue
+  // ---- Rehome queue ----
+
+  function queueIndexOf(id) {
+    for (var i = 0; i < root.rehomeQueue.length; i++) {
+      if (root.rehomeQueue[i].id === id) return i
+    }
+    return -1
+  }
+
+  function queueEntryFor(row) {
+    if (!row) return null
+    var idx = root.queueIndexOf(Model.rowId(row))
+    return idx >= 0 ? root.rehomeQueue[idx] : null
+  }
+
+  function queuedRow(entry) {
+    if (!entry) return null
+    return Model.findRowById(root.modelData, entry.id) || Model.findRow(root.modelData, entry.description, "")
+  }
+
+  function enqueueRehome(binding, lostKey, winner) {
+    if (!binding) return
+    var id = Model.rowId(binding)
+    var entry = {
+      id: id,
+      description: binding.description || "",
+      lostKey: lostKey || binding.default_key || "",
+      winner: winner || "",
+      default_key: binding.default_key || "",
+      action: binding.action || "",
+      command: binding.command || ""
+    }
+    var q = root.rehomeQueue.slice()
+    var idx = root.queueIndexOf(id)
+    if (idx >= 0) q[idx] = entry
+    else q.push(entry)
+    root.rehomeQueue = q
+  }
+
+  function dequeueRehome(id) {
+    var idx = root.queueIndexOf(id)
+    if (idx < 0) return
+    var q = root.rehomeQueue.slice()
+    q.splice(idx, 1)
+    root.rehomeQueue = q
+  }
+
+  function pruneRehomeQueue() {
+    // Drop entries whose binding has a key again (or vanished).
+    var q = []
+    for (var i = 0; i < root.rehomeQueue.length; i++) {
+      var e = root.rehomeQueue[i]
+      var row = root.queuedRow(e)
+      if (row && row.status === "disabled" && !row.key) q.push(e)
+    }
+    if (q.length !== root.rehomeQueue.length) root.rehomeQueue = q
+  }
+
+  function openRehomeEntry(entry) {
+    if (!entry) return
+    var row = root.queuedRow(entry)
+    if (!row) {
+      row = { id: entry.id, description: entry.description, default_key: entry.default_key,
+              action: entry.action || "", command: entry.command || "", status: "disabled", key: null }
+    }
+    var lostKey = row.default_key || entry.lostKey
+    editDialog.openRehome(row, lostKey, entry.winner)
+  }
+
+  function advanceRehomeQueue() {
+    if (!root.rehomeAutoOpen) return
+    if (editDialog.opened || root.askOpen || root.busy) return
+    root.rehomeAutoOpen = false
+    if (root.rehomeQueue.length === 0) return
+    // Newest displacement first: a chain (A took B's key, B took C's) opens C.
+    root.openRehomeEntry(root.rehomeQueue[root.rehomeQueue.length - 1])
+  }
+
+  function openRehomeFor(row) {
+    if (!row) return
+    var info = root.needsKeyInfo(row)
+    root.enqueueRehome(row, row.default_key || "", info.winner)
+    root.openRehomeEntry(root.queueEntryFor(row))
+  }
+
+  function remainingToast() {
+    var n = root.rehomeQueue.length
+    if (n > 0) root.showToast(n === 1 ? "1 binding still needs a key" : n + " bindings still need a key")
+  }
+
+  // { needs, winner, lostKey } for a row: disabled rows whose default key is
+  // held by another active row, or rows still sitting in the rehome queue.
+  function needsKeyInfo(row) {
+    var res = { needs: false, winner: "", lostKey: "" }
+    if (!row || row.status !== "disabled") return res
+    var id = Model.rowId(row)
+    if (row.default_key) {
+      var holders = Model.holdersOf(root.modelData, row.default_key, id)
+      if (holders.length > 0) {
+        res.needs = true
+        res.winner = holders[0].description || ""
+        res.lostKey = row.default_key
+        return res
       }
-
-      res.push(item)
+    }
+    var entry = root.queueEntryFor(row)
+    if (entry) {
+      res.needs = true
+      res.winner = entry.winner
+      res.lostKey = entry.lostKey
     }
     return res
   }
 
-  // Filtered modified & custom bindings
-  readonly property var filteredModified: {
-    var list = root.modelData.active || []
-    var q = root.searchQuery.trim().toLowerCase()
-    var cat = root.currentCategory
+  // ---- "ask" conflict card ----
 
-    var res = []
-    for (var i = 0; i < list.length; i++) {
-      var item = list[i]
-      if (item.status !== "modified" && item.status !== "custom") continue
-      if (cat !== "All" && item.category !== cat) continue
-
-      if (q.length > 0) {
-        var matchKey = item.key && item.key.toLowerCase().indexOf(q) !== -1
-        var matchDesc = item.description && item.description.toLowerCase().indexOf(q) !== -1
-        var matchCmd = (item.command && item.command.toLowerCase().indexOf(q) !== -1) ||
-                       (item.action && item.action.toLowerCase().indexOf(q) !== -1)
-        var matchCat = item.category && item.category.toLowerCase().indexOf(q) !== -1
-
-        if (!matchKey && !matchDesc && !matchCmd && !matchCat) continue
-      }
-
-      res.push(item)
+  function resolveAsk(choice) {
+    // choice: "rehome" | "override" | "cancel"
+    root.askOpen = false
+    var conflict = root.askConflict
+    root.askConflict = null
+    if (choice === "cancel") {
+      root.pendingSave = null
+      root.focusSearch()
+      return
     }
-    return res
+    if (root.askRemember) root.setConflictMode(choice)
+    root.askRemember = false
+    if (!root.pendingSave) return
+    root.pendingSave.mode = choice
+    if (root.busy) {
+      root.showToast("Still applying the previous change — try again in a moment")
+      root.pendingSave = null
+      return
+    }
+    root.runSet(true)
   }
 
-  // Filtered catalog presets
-  readonly property var filteredCatalog: {
-    var list = root.modelData.catalog || []
-    var q = root.searchQuery.trim().toLowerCase()
-    var cat = root.currentCategory
+  // --- Search -------------------------------------------------------------
+  // The row delegates are created once per model load and only toggle
+  // `visible` while you type: filtering is one indexOf per row against a
+  // lowercase haystack precomputed when the backend JSON arrives, so a
+  // keystroke never rebuilds the list.
+  property string lastListJson: ""
+  readonly property string searchNeedle: root.searchQuery.trim().toLowerCase()
+  // Every word you type must appear somewhere in the row, in any order:
+  // "focus right" finds "Focus on right window".
+  readonly property var searchTokens: root.searchNeedle.length ? root.searchNeedle.split(/\s+/) : []
 
-    var res = []
-    for (var i = 0; i < list.length; i++) {
-      var item = list[i]
-
-      if (cat !== "All" && item.category !== cat) continue
-
-      if (q.length > 0) {
-        var matchName = item.name && item.name.toLowerCase().indexOf(q) !== -1
-        var matchDesc = item.description && item.description.toLowerCase().indexOf(q) !== -1
-        var matchKey = item.default_key && item.default_key.toLowerCase().indexOf(q) !== -1
-        if (!matchName && !matchDesc && !matchKey) continue
-      }
-
-      res.push(item)
+  function indexModel(parsed) {
+    var act = parsed.active || []
+    for (var i = 0; i < act.length; i++) {
+      var r = act[i]
+      r._search = [r.key, r.description, r.command, r.action, r.category].join("\n").toLowerCase()
     }
-    return res
+    var cat = parsed.catalog || []
+    for (var j = 0; j < cat.length; j++) {
+      var c = cat[j]
+      c._search = [c.name, c.description, c.default_key].join("\n").toLowerCase()
+    }
   }
+  function searchHit(item) {
+    var toks = root.searchTokens
+    if (toks.length === 0) return true
+    if (!item) return false
+    var hay = item._search
+    if (hay === undefined) return true
+    for (var i = 0; i < toks.length; i++) {
+      if (hay.indexOf(toks[i]) === -1) return false
+    }
+    return true
+  }
+  function activeMatches(item) {
+    if (!item) return false
+    if (root.currentCategory !== "All" && item.category !== root.currentCategory) return false
+    return root.searchHit(item)
+  }
+  function modifiedMatches(item) {
+    if (!item || (item.status !== "modified" && item.status !== "custom")) return false
+    return root.activeMatches(item)
+  }
+  function catalogMatches(item) {
+    if (!item) return false
+    if (root.currentCategory !== "All" && item.category !== root.currentCategory) return false
+    return root.searchHit(item)
+  }
+
+  // Stable models for the repeaters (delegates live for the whole model load)
+  readonly property var allActive: root.modelData.active || []
+  readonly property var allCatalog: root.modelData.catalog || []
+  readonly property var allModified: root.allActive.filter(function(r) { return r.status === "modified" || r.status === "custom" })
+  // Bindings that lost their chord to another binding and still need a new one
+  readonly property var allNeedsKey: root.allActive.filter(function(r) { return root.needsKeyInfo(r).needs })
+  function needsKeyMatches(item) { return Boolean(item) && root.needsKeyInfo(item).needs && root.searchHit(item) }
+  readonly property var filteredNeedsKey: root.allNeedsKey.filter(root.needsKeyMatches)
+
+  // Match lists: only used for counts and empty states
+  readonly property var filteredActive: root.allActive.filter(root.activeMatches)
+  readonly property var filteredModified: root.allActive.filter(root.modifiedMatches)
+  readonly property var filteredCatalog: root.allCatalog.filter(root.catalogMatches)
 
   // Filtered conflicts
   readonly property var filteredConflicts: {
     return root.modelData.conflicts || []
+  }
+
+  // Resolve a conflicts-tab entry ({description, action}) to its real model row.
+  function conflictRow(key, sub) {
+    var row = null
+    if (sub && sub.id) row = Model.findRowById(root.modelData, String(sub.id))
+    if (!row && sub) row = Model.findRow(root.modelData, sub.description, key)
+    if (!row) {
+      row = { key: key, description: (sub && sub.description) || "", action: (sub && sub.action) || "", status: "modified", source: "user-file" }
+    }
+    return row
   }
 
   // --- Backend Subprocesses (bounded: capped output, wall-clock deadline,
@@ -299,21 +550,60 @@ Item {
 
   BoundedProcess {
     id: listProc
-    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/davedes.mouse-keybind-settings/backend/keybinds_manager.py", "list"]
+    command: [root.backendPath, "list"]
     maxBytes: 262144
     timeoutMs: 10000
     onFinished: {
       root.loading = false
-      if (!success) return
-      var text = stdout || ""
-      if (text && text.trim().length > 0) {
-        try {
-          var parsed = JSON.parse(text)
-          if (parsed) root.modelData = parsed
-        } catch (e) {
-          console.warn("KeybindsPanel: Failed to parse backend json:", e)
+      if (success) {
+        var text = stdout || ""
+        if (text && text.trim().length > 0) {
+          try {
+            if (text !== root.lastListJson) {
+              var parsed = JSON.parse(text)
+              if (parsed) {
+                root.indexModel(parsed)
+                root.lastListJson = text
+                root.modelData = parsed
+              }
+            }
+          } catch (e) {
+            console.warn("KeybindsPanel: Failed to parse backend json:", e)
+          }
         }
+      } else {
+        root.showToast("Could not load keybindings: " + root.failureText(listProc, root.parseResult(listProc), "unknown error"))
       }
+      if (root.reloadPending) {
+        Qt.callLater(root.loadData)
+        return
+      }
+      if (root.tryMigration()) return
+      root.pruneRehomeQueue()
+      root.advanceRehomeQueue()
+    }
+  }
+
+  // Run `migrate` once per session when the backend reports stray trailing
+  // lines; the list is reloaded afterwards. Deferred (not consumed) while busy.
+  function tryMigration() {
+    if (root.migrationTried || root.busy) return false
+    if (!(Number(root.modelData.pending_migration) > 0)) return false
+    root.migrationTried = true
+    return root.startProc(migrateProc, ["migrate"])
+  }
+
+  BoundedProcess {
+    id: migrateProc
+    maxBytes: 262144
+    timeoutMs: 30000
+    onFinished: {
+      root.loading = false
+      var res = root.parseResult(migrateProc)
+      if (!success || !res || res.success === false) {
+        root.showToast("Migration failed: " + root.failureText(migrateProc, res, "unknown error"))
+      }
+      root.loadData()
     }
   }
 
@@ -322,14 +612,50 @@ Item {
     maxBytes: 262144
     timeoutMs: 30000
     onFinished: {
-      console.log("[KB] setProc stdout:", stdout ? stdout.trim() : "(empty)")
       root.loading = false
-      if (!success) {
-        root.showToast("Failed to save keybinding")
+      var res = root.parseResult(setProc)
+      var p = root.pendingSave
+      root.pendingSave = null
+
+      if (!success || !res) {
+        root.showToast("Failed to save keybinding: " + root.failureText(setProc, res, "unknown error"))
+        root.loadData()
         return
       }
+
+      if (res.success === false && res.conflict && p && !p.displace) {
+        // "ask" mode probe hit a holder: let the user decide.
+        root.pendingSave = p
+        root.askConflict = res.conflict
+        root.askRemember = false
+        root.askOpen = true
+        root.loadData()
+        return
+      }
+
+      if (res.success === false) {
+        root.showToast("Save failed: " + root.failureText(setProc, res, "backend refused the change"))
+        root.loadData()
+        return
+      }
+
+      var displaced = res.displaced || null
+      var savedKey = res.key || (p ? p.key : "")
+      if (displaced && p && p.mode === "rehome") {
+        root.enqueueRehome(displaced, savedKey, p.desc)
+        root.rehomeAutoOpen = true
+        root.showToast("Saved. " + (displaced.description || "The other binding") + " needs a new key.")
+      } else if (displaced) {
+        root.showToast("Saved. " + (displaced.description || "The other binding") + " was unbound.")
+      } else {
+        root.showToast("Keybinding saved & applied to Hyprland!")
+      }
+      var savedEntry = p ? root.queueEntryFor({ id: p.id, description: p.desc }) : null
+      if (savedEntry) {
+        root.dequeueRehome(savedEntry.id)
+        if (root.rehomeQueue.length > 0) root.rehomeAutoOpen = true
+      }
       root.loadData()
-      root.showToast("Keybinding saved & applied to Hyprland!")
     }
   }
 
@@ -339,8 +665,10 @@ Item {
     timeoutMs: 30000
     onFinished: {
       root.loading = false
+      var res = root.parseResult(resetProc)
+      if (success && res && res.success !== false) root.showToast("Keybinding reset to default!")
+      else root.showToast("Reset failed: " + root.failureText(resetProc, res, "unknown error"))
       root.loadData()
-      if (success) root.showToast("Keybinding reset to default!")
     }
   }
 
@@ -350,8 +678,10 @@ Item {
     timeoutMs: 30000
     onFinished: {
       root.loading = false
+      var res = root.parseResult(enableProc)
+      if (success && res && res.success !== false) root.showToast("Keybinding re-enabled!")
+      else root.showToast("Enable failed: " + root.failureText(enableProc, res, "unknown error"))
       root.loadData()
-      if (success) root.showToast("Keybinding re-enabled!")
     }
   }
 
@@ -361,8 +691,11 @@ Item {
     timeoutMs: 30000
     onFinished: {
       root.loading = false
+      var res = root.parseResult(disableProc)
+      if (success && res && res.success !== false) root.showToast("Keybinding disabled!")
+      else root.showToast("Disable failed: " + root.failureText(disableProc, res, "unknown error"))
+      if (root.rehomeQueue.length > 0) root.rehomeAutoOpen = true
       root.loadData()
-      if (success) root.showToast("Keybinding disabled!")
     }
   }
 
@@ -377,7 +710,7 @@ Item {
     color: root.background
     implicitWidth: Style.space(1000)
     implicitHeight: Style.space(760)
-    minimumSize: Qt.size(Style.space(700), Style.space(520))
+    minimumSize: Qt.size(Style.space(380), Style.space(360))
 
     onVisibleChanged: {
       if (!visible && !root.closingFromHost && root.shell && typeof root.shell.hide === "function") {
@@ -411,7 +744,7 @@ Item {
           return
         }
 
-        var keyName = root.translateQtKey(event)
+        var keyName = Model.translateQtKey(event)
         if (keyName.length > 0) {
           var mods = []
           if (isSuper) mods.push("SUPER")
@@ -427,9 +760,14 @@ Item {
         }
       }
 
+      // Escape: popover -> conflict card -> dialog -> panel, in that order.
       Keys.onEscapePressed: function(event) {
         if (root.recordingSearch) {
           root.recordingSearch = false
+        } else if (root.settingsOpen) {
+          root.settingsOpen = false
+        } else if (root.askOpen) {
+          root.resolveAsk("cancel")
         } else if (editDialog.opened) {
           editDialog.close()
         } else {
@@ -438,9 +776,37 @@ Item {
         event.accepted = true
       }
 
-      ColumnLayout {
+      // Horizontal scroller: when the window is narrower than the page's
+      // minimum layout width, the page scrolls sideways instead of clipping.
+      Flickable {
+        id: pageFlick
         anchors.fill: parent
         anchors.margins: Style.space(22)
+        clip: true
+        flickableDirection: Flickable.HorizontalFlick
+        boundsBehavior: Flickable.StopAtBounds
+        contentWidth: pageCol.width
+        contentHeight: height
+        interactive: contentWidth > width
+
+        ScrollBar.horizontal: ScrollBar {
+          policy: pageFlick.contentWidth > pageFlick.width ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff
+        }
+
+        // Shift+wheel (or a horizontal wheel) pans sideways; plain wheel goes to the list below
+        WheelHandler {
+          acceptedModifiers: Qt.ShiftModifier
+          enabled: pageFlick.contentWidth > pageFlick.width
+          onWheel: function(event) {
+            var d = event.angleDelta.x !== 0 ? event.angleDelta.x : event.angleDelta.y
+            pageFlick.contentX = Math.max(0, Math.min(pageFlick.contentWidth - pageFlick.width, pageFlick.contentX - d))
+          }
+        }
+
+      ColumnLayout {
+        id: pageCol
+        width: Math.max(pageFlick.width, pageCol.Layout.minimumWidth)
+        height: pageFlick.height
         spacing: Style.space(16)
 
         // 1. Top Header Bar with Clean Layout
@@ -472,6 +838,7 @@ Item {
               }
 
               Text {
+                visible: !root.narrow
                 text: "Hyprland Shortcut Manager"
                 color: Util.alpha(root.foreground, 0.55)
                 font.family: Style.font.family
@@ -483,6 +850,7 @@ Item {
           // Search Bar (Expands flexibly to fill available width)
           Item {
             Layout.fillWidth: true
+            Layout.minimumWidth: Style.space(140)
             Layout.preferredHeight: Style.space(38)
 
             TextField {
@@ -518,7 +886,7 @@ Item {
             spacing: Style.space(8)
 
             Button {
-              text: "Add Keybinding"
+              text: root.narrow ? "Add" : "Add Keybinding"
               iconText: "➕"
               accent: root.accent
               selected: true
@@ -539,54 +907,73 @@ Item {
               horizontalPadding: Style.space(10)
               onClicked: Util.execDetached("omarchy-launch-config-editor $HOME/.config/hypr/bindings.lua")
             }
+
+            Button {
+              id: settingsGear
+              iconText: "⚙"
+              tooltipText: "Conflict handling: " + Model.conflictModeLabel(root.conflictMode)
+              selected: root.settingsOpen
+              accent: root.accent
+              horizontalPadding: Style.space(10)
+              onClicked: root.settingsOpen = !root.settingsOpen
+            }
           }
         }
 
-        // 2. Navigation Tabs (All Active vs Modified vs Catalog vs Conflicts)
-        RowLayout {
+        // 2. Navigation Tabs (wrap onto more lines when the window is narrow)
+        Flow {
           Layout.fillWidth: true
-          spacing: Style.space(12)
+          spacing: Style.space(8)
 
-          ButtonGroup {
-            id: tabGroup
-
-            Button {
-              text: "All Active (" + (root.modelData.total_active || 0) + ")"
-              selected: root.currentTab === "active"
-              horizontalPadding: Style.space(16)
-              onClicked: root.currentTab = "active"
-            }
-
-            Button {
-              text: "⭐ Modified & Custom (" + (root.modelData.total_modified || 0) + ")"
-              selected: root.currentTab === "modified"
-              accent: (root.modelData.total_modified > 0) ? "#FF9800" : root.foreground
-              horizontalPadding: Style.space(16)
-              onClicked: root.currentTab = "modified"
-            }
-
-            Button {
-              text: "Available Actions Catalog (" + ((root.modelData.catalog && root.modelData.catalog.length) || 0) + ")"
-              selected: root.currentTab === "catalog"
-              horizontalPadding: Style.space(16)
-              onClicked: root.currentTab = "catalog"
-            }
-
-            Button {
-              text: "⚠️ Conflicts (" + (root.modelData.total_conflicts || 0) + ")"
-              selected: root.currentTab === "conflicts"
-              accent: (root.modelData.total_conflicts > 0) ? root.urgent : root.foreground
-              horizontalPadding: Style.space(16)
-              onClicked: root.currentTab = "conflicts"
-            }
+          Button {
+            text: (root.narrow ? "All (" : "All Active (") + (root.modelData.total_active || 0) + ")"
+            selected: root.currentTab === "active"
+            horizontalPadding: Style.space(root.narrow ? 12 : 16)
+            onClicked: root.currentTab = "active"
           }
 
-          Item { Layout.fillWidth: true }
+          Button {
+            text: (root.narrow ? "⭐ Modified (" : "⭐ Modified & Custom (") + (root.modelData.total_modified || 0) + ")"
+            selected: root.currentTab === "modified"
+            accent: (root.modelData.total_modified > 0) ? "#FF9800" : root.foreground
+            horizontalPadding: Style.space(root.narrow ? 12 : 16)
+            onClicked: root.currentTab = "modified"
+          }
+
+          Button {
+            text: "🔑 Needs key (" + root.allNeedsKey.length + ")"
+            selected: root.currentTab === "needskey"
+            accent: (root.allNeedsKey.length > 0) ? "#FF9800" : root.foreground
+            horizontalPadding: Style.space(root.narrow ? 12 : 16)
+            onClicked: root.currentTab = "needskey"
+          }
+
+          Button {
+            text: (root.narrow ? "Catalog (" : "Available Actions Catalog (") + ((root.modelData.catalog && root.modelData.catalog.length) || 0) + ")"
+            selected: root.currentTab === "catalog"
+            horizontalPadding: Style.space(root.narrow ? 12 : 16)
+            onClicked: root.currentTab = "catalog"
+          }
+
+          Button {
+            text: "⚠️ Conflicts (" + (root.modelData.total_conflicts || 0) + ")"
+            selected: root.currentTab === "conflicts"
+            accent: (root.modelData.total_conflicts > 0) ? root.urgent : root.foreground
+            horizontalPadding: Style.space(root.narrow ? 12 : 16)
+            onClicked: root.currentTab = "conflicts"
+          }
+
+          Button {
+            text: root.narrow ? "🪜 Ladder" : "🪜 Modifier ladder"
+            selected: root.currentTab === "ladder"
+            horizontalPadding: Style.space(root.narrow ? 12 : 16)
+            onClicked: root.currentTab = "ladder"
+          }
         }
 
         // 3. Category Filter Chips & Record to Find on the Right
         RowLayout {
-          visible: root.currentTab !== "conflicts"
+          visible: root.currentTab !== "conflicts" && root.currentTab !== "ladder"
           Layout.fillWidth: true
           spacing: Style.space(12)
 
@@ -666,29 +1053,6 @@ Item {
           clip: true
           ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
-          WheelHandler {
-            target: scrollArea.contentItem
-            acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
-            onWheel: function(event) {
-              var factor = (root.modelData.mouse_settings && root.modelData.mouse_settings.scroll_factor) || 1.0
-
-              var dy = event.angleDelta.y
-              if (dy === 0) dy = event.pixelDelta.y
-
-              // natural_scroll is applied by libinput before the event reaches the
-              // client, so re-inverting here would double-flip the axis.
-              var step = (dy / 120.0) * 100.0 * factor
-
-              var flick = scrollArea.contentItem
-              if (flick && flick.contentY !== undefined) {
-                var newY = flick.contentY - step
-                var maxY = Math.max(0, flick.contentHeight - flick.height)
-                flick.contentY = Math.max(0, Math.min(maxY, newY))
-                event.accepted = true
-              }
-            }
-          }
-
           ColumnLayout {
             width: scrollArea.availableWidth
             spacing: Style.space(8)
@@ -697,16 +1061,20 @@ Item {
             // --- TAB 1: ALL ACTIVE KEYBINDINGS (ALPHABETICAL) ---
             // =========================================================
             ColumnLayout {
-              visible: root.currentTab === "active"
+              visible: root.currentTab === "active" || root.currentTab === "needskey"
               Layout.fillWidth: true
               spacing: Style.space(8)
 
               Repeater {
-                model: root.filteredActive
+                model: root.allActive
 
                 BorderSurface {
                   id: activeRow
                   required property var modelData
+                  visible: root.currentTab === "needskey" ? root.needsKeyMatches(activeRow.modelData) : root.activeMatches(activeRow.modelData)
+                  readonly property var needsKey: root.needsKeyInfo(activeRow.modelData)
+                  readonly property bool isDisabled: Boolean(activeRow.modelData && activeRow.modelData.status === "disabled")
+                  readonly property string rowId: Model.rowId(activeRow.modelData)
                   Layout.fillWidth: true
                   Layout.preferredHeight: Style.space(64)
                   radius: Style.cornerRadius
@@ -716,7 +1084,9 @@ Item {
                   borderSpec: Border.flat(
                     (modelData && modelData.is_conflict)
                       ? root.urgent
-                      : (activeRowMouse.containsMouse ? Util.alpha(root.foreground, 0.25) : Util.alpha(root.foreground, 0.1)),
+                      : (activeRow.needsKey.needs
+                        ? Util.alpha(root.urgent, 0.6)
+                        : (activeRowMouse.containsMouse ? Util.alpha(root.foreground, 0.25) : Util.alpha(root.foreground, 0.1))),
                     (modelData && modelData.is_conflict) ? 1.5 : 1
                   )
 
@@ -740,7 +1110,7 @@ Item {
                       radius: Style.cornerRadius
 
                       readonly property string st: (activeRow.modelData && activeRow.modelData.status) || "default"
-                      readonly property bool isConf: Boolean(activeRow.modelData && activeRow.modelData.is_conflict)
+                      readonly property bool isConf: Boolean(activeRow.modelData && activeRow.modelData.is_conflict) || activeRow.needsKey.needs
 
                       color: isConf
                         ? Util.alpha(root.urgent, 0.2)
@@ -762,8 +1132,10 @@ Item {
                         anchors.centerIn: parent
                         text: (activeRow.modelData && activeRow.modelData.is_conflict)
                           ? "⚠️ CONFLICT"
-                          : (activeRow.modelData && activeRow.modelData.status ? activeRow.modelData.status.toUpperCase() : "DEFAULT")
-                        color: (activeRow.modelData && activeRow.modelData.is_conflict)
+                          : (activeRow.needsKey.needs
+                            ? "NEEDS KEY"
+                            : (activeRow.modelData && activeRow.modelData.status ? activeRow.modelData.status.toUpperCase() : "DEFAULT"))
+                        color: ((activeRow.modelData && activeRow.modelData.is_conflict) || activeRow.needsKey.needs)
                           ? root.urgent
                           : (activeRow.modelData && activeRow.modelData.status === "custom" ? "#4CAF50"
                             : (activeRow.modelData && activeRow.modelData.status === "modified" ? "#FF9800"
@@ -817,19 +1189,22 @@ Item {
 
                       Text {
                         Layout.fillWidth: true
-                        text: (activeRow.modelData && (activeRow.modelData.command || activeRow.modelData.action)) || ""
+                        text: activeRow.needsKey.needs
+                          ? ((activeRow.needsKey.lostKey ? activeRow.needsKey.lostKey + " " : "") + "taken by " + (activeRow.needsKey.winner || "another binding"))
+                          : ((activeRow.modelData && (activeRow.modelData.command || activeRow.modelData.action)) || "")
                         textFormat: Text.PlainText
-                        color: Util.alpha(root.foreground, 0.5)
+                        color: activeRow.needsKey.needs ? root.urgent : Util.alpha(root.foreground, 0.5)
                         font.family: Style.font.family
                         font.pixelSize: Style.font.caption
                         elide: Text.ElideRight
                       }
                     }
 
-                    // Key Badge
+                    // Key Badge (disabled rows show their default key, dimmed)
                     KeyBadge {
                       Layout.alignment: Qt.AlignVCenter
-                      keyText: (activeRow.modelData && activeRow.modelData.key) || ""
+                      keyText: (activeRow.modelData && (activeRow.modelData.key || (activeRow.isDisabled ? activeRow.modelData.default_key : ""))) || ""
+                      opacity: activeRow.isDisabled ? 0.4 : 1.0
                       highlighted: Boolean(activeRow.modelData && activeRow.modelData.is_conflict)
                       accent: (activeRow.modelData && activeRow.modelData.is_conflict) ? root.urgent : root.accent
                     }
@@ -839,8 +1214,19 @@ Item {
                       Layout.alignment: Qt.AlignVCenter
                       spacing: Style.space(6)
 
-                      // Edit
+                      // Pick key (needs-key rows) / Edit
                       Button {
+                        visible: activeRow.needsKey.needs
+                        text: "Pick key…"
+                        accent: root.urgent
+                        selected: true
+                        horizontalPadding: Style.space(10)
+                        verticalPadding: Style.space(4)
+                        onClicked: root.openRehomeFor(activeRow.modelData)
+                      }
+
+                      Button {
+                        visible: !activeRow.needsKey.needs
                         iconText: "✏️"
                         tooltipText: "Modify Keybinding"
                         horizontalPadding: Style.space(8)
@@ -850,14 +1236,14 @@ Item {
 
                       // Enable (if disabled)
                       Button {
-                        visible: Boolean(activeRow.modelData && activeRow.modelData.status === "disabled")
+                        visible: activeRow.isDisabled && !activeRow.needsKey.needs
                         text: "Enable"
                         iconText: "✓"
                         accent: "#4CAF50"
                         tooltipText: "Re-enable Keybinding"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
-                        onClicked: root.enableKeybinding(activeRow.modelData.key)
+                        onClicked: root.enableKeybinding(activeRow.modelData.key || activeRow.modelData.default_key || "", activeRow.rowId)
                       }
 
                       // Reset (if modified)
@@ -867,21 +1253,21 @@ Item {
                         tooltipText: "Reset to Default (" + ((activeRow.modelData && activeRow.modelData.default_key) || "") + ")"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
-                        onClicked: root.resetKeybinding(activeRow.modelData.key, activeRow.modelData.default_key)
+                        onClicked: root.resetKeybinding(activeRow.modelData.key, activeRow.modelData.default_key, activeRow.rowId)
                       }
 
                       // Disable / Delete
                       Button {
-                        visible: Boolean(activeRow.modelData && activeRow.modelData.status !== "disabled")
+                        visible: !activeRow.isDisabled
                         iconText: (activeRow.modelData && activeRow.modelData.status === "custom") ? "🗑️" : "⊘"
                         tooltipText: (activeRow.modelData && activeRow.modelData.status === "custom") ? "Delete custom binding" : "Disable default binding"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: {
                           if (activeRow.modelData.status === "custom") {
-                            root.resetKeybinding(activeRow.modelData.key, "")
+                            root.resetKeybinding(activeRow.modelData.key, "", activeRow.rowId)
                           } else {
-                            root.disableKeybinding(activeRow.modelData.key)
+                            root.disableKeybinding(activeRow.modelData.key, activeRow.rowId)
                           }
                         }
                       }
@@ -890,9 +1276,9 @@ Item {
                 }
               }
 
-              // Empty state for active list
+              // Empty state for active / needs-key list
               BorderSurface {
-                visible: root.filteredActive.length === 0
+                visible: root.currentTab === "needskey" ? root.filteredNeedsKey.length === 0 : root.filteredActive.length === 0
                 Layout.fillWidth: true
                 Layout.preferredHeight: Style.space(170)
                 radius: Style.cornerRadius
@@ -904,9 +1290,11 @@ Item {
                   spacing: Style.space(10)
 
                   Text {
-                    text: root.searchQuery.length > 0
-                      ? ("No keybinding found for \"" + root.searchQuery + "\"")
-                      : "No keybindings match your filter."
+                    text: root.currentTab === "needskey"
+                      ? (root.allNeedsKey.length === 0 ? "Every binding has a key. Nothing to do here." : "No binding waiting for a key matches your search.")
+                      : root.searchQuery.length > 0
+                        ? ("No keybinding found for \"" + root.searchQuery + "\"")
+                        : "No keybindings match your filter."
                     textFormat: Text.PlainText
                     color: root.foreground
                     font.family: Style.font.family
@@ -916,7 +1304,7 @@ Item {
                   }
 
                   Text {
-                    visible: root.searchQuery.length > 0
+                    visible: root.searchQuery.length > 0 && root.currentTab !== "needskey"
                     text: "This shortcut combination is currently free and unassigned."
                     color: Util.alpha(root.foreground, 0.6)
                     font.family: Style.font.family
@@ -950,11 +1338,12 @@ Item {
               spacing: Style.space(8)
 
               Repeater {
-                model: root.filteredModified
+                model: root.allModified
 
                 BorderSurface {
                   id: modRow
                   required property var modelData
+                  visible: root.activeMatches(modRow.modelData)
                   Layout.fillWidth: true
                   Layout.preferredHeight: Style.space(64)
                   radius: Style.cornerRadius
@@ -1073,7 +1462,7 @@ Item {
                         tooltipText: "Reset to Default (" + ((modRow.modelData && modRow.modelData.default_key) || "") + ")"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
-                        onClicked: root.resetKeybinding(modRow.modelData.key, modRow.modelData.default_key)
+                        onClicked: root.resetKeybinding(modRow.modelData.key, modRow.modelData.default_key, Model.rowId(modRow.modelData))
                       }
 
                       Button {
@@ -1082,7 +1471,7 @@ Item {
                         tooltipText: "Delete custom binding"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
-                        onClicked: root.resetKeybinding(modRow.modelData.key, "")
+                        onClicked: root.resetKeybinding(modRow.modelData.key, "", Model.rowId(modRow.modelData))
                       }
                     }
                   }
@@ -1110,11 +1499,12 @@ Item {
               spacing: Style.space(8)
 
               Repeater {
-                model: root.filteredCatalog
+                model: root.allCatalog
 
                 BorderSurface {
                   id: catalogRow
                   required property var modelData
+                  visible: root.catalogMatches(catalogRow.modelData)
                   Layout.fillWidth: true
                   Layout.preferredHeight: Style.space(60)
                   radius: Style.cornerRadius
@@ -1227,6 +1617,176 @@ Item {
                 font.pixelSize: Style.font.body
                 Layout.alignment: Qt.AlignHCenter
                 Layout.topMargin: Style.space(40)
+              }
+            }
+
+            // =========================================================
+            // --- TAB: MODIFIER LADDER (how stock picks Shift / Ctrl / Alt) ---
+            // =========================================================
+            ColumnLayout {
+              visible: root.currentTab === "ladder"
+              Layout.fillWidth: true
+              spacing: Style.space(12)
+
+              Text {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: "Super is the base and the letter is a mnemonic. Each extra modifier answers one question. The manual never spells this out, but the stock bindings follow it with very few exceptions, so a new key that fits the ladder will feel like it was always there."
+                color: Util.alpha(root.foreground, 0.75)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+              }
+
+              GridLayout {
+                Layout.fillWidth: true
+                columns: width > 1100 ? 2 : 1
+                columnSpacing: Style.space(12)
+                rowSpacing: Style.space(12)
+
+                Repeater {
+                  model: root.ladderRungs
+
+                  BorderSurface {
+                    id: rungCard
+                    required property var modelData
+                    Layout.fillWidth: true
+                    Layout.alignment: Qt.AlignTop
+                    implicitHeight: rungCol.implicitHeight + Style.space(32)
+                    radius: Style.cornerRadius
+                    color: Util.alpha(root.foreground, 0.03)
+                    borderSpec: Border.flat(Util.alpha(root.foreground, 0.12), 1)
+
+                    ColumnLayout {
+                      id: rungCol
+                      x: Style.space(16)
+                      y: Style.space(16)
+                      width: rungCard.width - Style.space(32)
+                      spacing: Style.space(8)
+
+                      KeyBadge {
+                        keyText: rungCard.modelData.chord
+                        highlighted: true
+                        fontSize: Style.font.body
+                      }
+
+                      Text {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        text: rungCard.modelData.rule
+                        color: root.foreground
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.body
+                        font.bold: true
+                      }
+
+                      Text {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        text: rungCard.modelData.why
+                        color: Util.alpha(root.foreground, 0.7)
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                      }
+
+                      Rectangle {
+                        visible: rungCard.modelData.pairs.length > 0
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 1
+                        color: Util.alpha(root.foreground, 0.1)
+                      }
+
+                      GridLayout {
+                        visible: rungCard.modelData.pairs.length > 0
+                        Layout.fillWidth: true
+                        columns: 2
+                        columnSpacing: Style.space(14)
+                        rowSpacing: Style.space(3)
+
+                        Repeater {
+                          model: rungCard.modelData.pairs.length * 2
+
+                          Text {
+                            required property int index
+                            readonly property bool isChord: index % 2 === 0
+                            readonly property var pair: rungCard.modelData.pairs[Math.floor(index / 2)]
+                            Layout.fillWidth: !isChord
+                            wrapMode: isChord ? Text.NoWrap : Text.WordWrap
+                            text: isChord ? pair[0] : pair[1]
+                            color: isChord ? root.foreground : Util.alpha(root.foreground, 0.7)
+                            font.family: isChord ? Style.font.monoFamily || Style.font.family : Style.font.family
+                            font.pixelSize: Style.font.caption
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+
+              BorderSurface {
+                id: commaCard
+                Layout.fillWidth: true
+                implicitHeight: commaCol.implicitHeight + Style.space(32)
+                radius: Style.cornerRadius
+                color: Util.alpha(root.accent, 0.05)
+                borderSpec: Border.flat(Util.alpha(root.accent, 0.35), 1)
+
+                ColumnLayout {
+                  id: commaCol
+                  x: Style.space(16)
+                  y: Style.space(16)
+                  width: commaCard.width - Style.space(32)
+                  spacing: Style.space(8)
+
+                  Text {
+                    text: "ONE KEY, THE WHOLE LADDER"
+                    color: Util.alpha(root.foreground, 0.55)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                    font.letterSpacing: 1
+                  }
+
+                  Text {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    text: "Notifications on comma (stock). One key, five modifier combinations, each answering a different question about the same noun."
+                    color: root.foreground
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.body
+                  }
+
+                  Repeater {
+                    model: root.ladderComma
+
+                    RowLayout {
+                      required property var modelData
+                      Layout.fillWidth: true
+                      spacing: Style.space(12)
+
+                      KeyBadge {
+                        keyText: modelData[0]
+                        Layout.preferredWidth: Style.space(260)
+                      }
+
+                      Text {
+                        Layout.fillWidth: true
+                        text: modelData[1]
+                        color: root.foreground
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                      }
+
+                      Text {
+                        text: modelData[2]
+                        color: Util.alpha(root.accent, 0.9)
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                        font.italic: true
+                      }
+                    }
+                  }
+                }
               }
             }
 
@@ -1346,13 +1906,7 @@ Item {
                               selected: true
                               horizontalPadding: Style.space(12)
                               verticalPadding: Style.space(4)
-                              onClicked: {
-                                editDialog.openEdit({
-                                  key: conflictCard.modelData.key,
-                                  description: confSubRow.modelData.description,
-                                  action: confSubRow.modelData.action
-                                })
-                              }
+                              onClicked: editDialog.openEdit(root.conflictRow(conflictCard.modelData.key, confSubRow.modelData))
                             }
                           }
                         }
@@ -1406,15 +1960,270 @@ Item {
           }
         }
       }
+      }
 
-      // Add / Edit Modal Dialog (child of mainContainer, fills the window)
+      // Add / Edit / Rehome Modal Dialog (child of mainContainer, fills the window)
       EditKeybindDialog {
         id: editDialog
         anchors.fill: parent
-        allBindings: root.modelData && root.modelData.active
-        catalog: root.modelData && root.modelData.catalog
-        onSaved: function(key, desc, cmd, action, oldKey, overrideConflict) {
-          root.saveKeybinding(key, desc, cmd, action, oldKey, overrideConflict)
+        z: 5
+        allBindings: (root.modelData && root.modelData.active) || []
+        catalog: (root.modelData && root.modelData.catalog) || []
+        conflictMode: root.conflictMode
+        saving: root.busy
+        onSaved: function(key, desc, cmd, action, oldKey, id) {
+          root.saveKeybinding(key, desc, cmd, action, oldKey, id)
+        }
+        onDisableRequested: function(id, key) {
+          if (root.disableKeybinding(key, id)) root.dequeueRehome(id)
+          else root.remainingToast()
+        }
+        onUnboundAccepted: function(id) {
+          root.dequeueRehome(id)
+          if (root.rehomeQueue.length > 0) {
+            root.rehomeAutoOpen = true
+            root.advanceRehomeQueue()
+          }
+        }
+        onCanceled: {
+          // A rehome dialog closed without a decision: the binding stays queued.
+          if (editDialog.isRehome) root.remainingToast()
+        }
+        onClosed: root.focusSearch()
+      }
+
+      // "Ask" conflict card: shown when conflictMode is "ask" and the probe hit a holder.
+      Item {
+        id: askCard
+        anchors.fill: parent
+        visible: root.askOpen
+        z: 6
+
+        Rectangle {
+          anchors.fill: parent
+          color: Util.alpha(root.background, 0.7)
+
+          MouseArea { anchors.fill: parent; onClicked: root.resolveAsk("cancel") }
+
+          BorderSurface {
+            id: askSurface
+            width: Math.min(parent.width - Style.space(64), Style.space(520))
+            height: askSurface.contentTopInset + askSurface.contentBottomInset + askLayout.implicitHeight
+            anchors.centerIn: parent
+            color: root.background
+            borderSpec: Border.flat(root.urgent, Style.normalBorderWidth)
+            radius: Style.cornerRadius
+            padding: Style.space(22)
+
+            MouseArea { anchors.fill: parent; onClicked: {} }
+
+            ColumnLayout {
+              id: askLayout
+              anchors.top: parent.top
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.topMargin: askSurface.contentTopInset
+              anchors.leftMargin: askSurface.contentLeftInset
+              anchors.rightMargin: askSurface.contentRightInset
+              spacing: Style.space(14)
+
+              Text {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                text: {
+                  var k = (root.pendingSave && root.pendingSave.key) || ""
+                  var d = (root.askConflict && root.askConflict.description) || "another binding"
+                  return k + " is already " + d + ". What should happen to it?"
+                }
+                color: root.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.title
+              }
+
+              Text {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: "Rehome keeps the other binding and asks you for its new key. Override unbinds it."
+                color: Util.alpha(root.foreground, 0.65)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+
+              Toggle {
+                Layout.fillWidth: true
+                label: "Remember my choice"
+                description: "Stops asking; change it later from the gear menu."
+                checked: root.askRemember
+                foreground: root.foreground
+                accent: root.accent
+                onClicked: root.askRemember = !root.askRemember
+              }
+
+              RowLayout {
+                Layout.fillWidth: true
+                spacing: Style.space(10)
+
+                Item { Layout.fillWidth: true }
+
+                Button {
+                  text: "Cancel"
+                  horizontalPadding: Style.space(16)
+                  verticalPadding: Style.space(6)
+                  onClicked: root.resolveAsk("cancel")
+                }
+
+                Button {
+                  text: "Just override"
+                  accent: root.urgent
+                  horizontalPadding: Style.space(16)
+                  verticalPadding: Style.space(6)
+                  onClicked: root.resolveAsk("override")
+                }
+
+                Button {
+                  text: "Rehome the other binding"
+                  accent: root.accent
+                  selected: true
+                  horizontalPadding: Style.space(16)
+                  verticalPadding: Style.space(6)
+                  onClicked: root.resolveAsk("rehome")
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Settings popover (conflict handling mode)
+      Item {
+        id: settingsPopover
+        anchors.fill: parent
+        visible: root.settingsOpen
+        z: 7
+
+        MouseArea { anchors.fill: parent; onClicked: root.settingsOpen = false }
+
+        BorderSurface {
+          id: popoverCard
+          anchors.top: parent.top
+          anchors.right: parent.right
+          anchors.topMargin: Style.space(22) + settingsGear.height + Style.space(8)
+          anchors.rightMargin: Style.space(22)
+          width: Style.space(360)
+          height: popoverCard.contentTopInset + popoverCard.contentBottomInset + popoverLayout.implicitHeight
+          color: root.background
+          borderSpec: Border.flat(Util.alpha(root.foreground, 0.3), 1)
+          radius: Style.cornerRadius
+          padding: Style.space(16)
+
+          MouseArea { anchors.fill: parent; onClicked: {} }
+
+          ColumnLayout {
+            id: popoverLayout
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.topMargin: popoverCard.contentTopInset
+            anchors.leftMargin: popoverCard.contentLeftInset
+            anchors.rightMargin: popoverCard.contentRightInset
+            spacing: Style.space(8)
+
+            Text {
+              text: "When a saved key is already taken"
+              color: root.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+              font.bold: true
+            }
+
+            Repeater {
+              model: [
+                { value: "rehome", label: "Rehome the other binding", hint: "Take the key, then ask me for the other binding's new key. (default)" },
+                { value: "override", label: "Just override", hint: "Take the key and leave the other binding unbound." },
+                { value: "ask", label: "Ask every time", hint: "Show a choice before anything is written." }
+              ]
+
+              BorderSurface {
+                id: modeOption
+                required property var modelData
+                readonly property bool isSelected: root.conflictMode === modelData.value
+                Layout.fillWidth: true
+                implicitHeight: modeOptionLayout.implicitHeight + Style.space(16)
+                radius: Style.cornerRadius
+                color: isSelected
+                  ? Util.alpha(root.accent, 0.18)
+                  : (modeOptionMouse.containsMouse ? Util.alpha(root.foreground, 0.08) : Util.alpha(root.foreground, 0.03))
+                borderSpec: Border.flat(isSelected ? root.accent : Util.alpha(root.foreground, 0.15), 1)
+
+                MouseArea {
+                  id: modeOptionMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.setConflictMode(modeOption.modelData.value)
+                    root.settingsOpen = false
+                  }
+                }
+
+                ColumnLayout {
+                  id: modeOptionLayout
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.space(12)
+                  anchors.rightMargin: Style.space(12)
+                  spacing: Style.space(2)
+
+                  Text {
+                    text: (modeOption.isSelected ? "● " : "○ ") + modeOption.modelData.label
+                    color: modeOption.isSelected ? root.accent : root.foreground
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.body
+                    font.bold: modeOption.isSelected
+                  }
+
+                  Text {
+                    Layout.fillWidth: true
+                    text: modeOption.modelData.hint
+                    wrapMode: Text.WordWrap
+                    color: Util.alpha(root.foreground, 0.6)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Toast
+      BorderSurface {
+        id: toast
+        visible: root.toastVisible
+        z: 8
+        anchors.bottom: parent.bottom
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottomMargin: Style.space(22)
+        width: Math.min(parent.width - Style.space(64), toastText.implicitWidth + Style.space(32))
+        height: toastText.implicitHeight + Style.space(20)
+        radius: Style.cornerRadius
+        color: root.background
+        borderSpec: Border.flat(root.accent, 1)
+
+        Text {
+          id: toastText
+          anchors.centerIn: parent
+          width: Math.min(implicitWidth, toast.width - Style.space(24))
+          text: root.toastMessage
+          textFormat: Text.PlainText
+          wrapMode: Text.WordWrap
+          horizontalAlignment: Text.AlignHCenter
+          color: root.foreground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
         }
       }
     }

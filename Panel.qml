@@ -55,25 +55,63 @@ Panel {
     return "https://www.paypal.com/paypalme/DavidDesousa13"
   }
 
+  readonly property string settingsDir: Quickshell.env("HOME") + "/.local/state/omarchy/settings"
+  readonly property string settingsPath: root.settingsDir + "/davedes.mouse-keybind-settings.json"
+
   function setShowBuyButton(v) {
     root.showBuyButton = !!v
-    buyButtonFile.setText(JSON.stringify({ showBuyButton: root.showBuyButton }, null, 2) + "\n")
+    // Read-modify-write: the same file also carries keybindConflictMode
+    // (written by KeybindsPanel), so never overwrite keys we don't own.
+    var data = {}
+    try {
+      var cur = JSON.parse(buyButtonFile.text())
+      if (Util.isPlainObject(cur)) data = cur
+    } catch (e) { /* missing or corrupt file -> start fresh */ }
+    data.showBuyButton = root.showBuyButton
+    root.writePluginSettings(JSON.stringify(data, null, 2) + "\n")
   }
 
-  // Persisted config for the dropdown (currently just the Buy button toggle).
+  // Writes go through a mkdir -p first so a fresh machine (no state dir yet)
+  // still persists; the latest pending text wins if several writes queue up.
+  property string pendingSettingsText: ""
+
+  function writePluginSettings(text) {
+    root.pendingSettingsText = text
+    if (!settingsDirProc.running) settingsDirProc.running = true
+  }
+
+  BoundedProcess {
+    id: settingsDirProc
+    command: ["mkdir", "-p", root.settingsDir]
+    timeoutMs: 5000
+    onFinished: {
+      if (root.pendingSettingsText.length > 0) {
+        buyButtonFile.setText(root.pendingSettingsText)
+        root.pendingSettingsText = ""
+      }
+    }
+  }
+
+  function applyPluginSettings(raw) {
+    try {
+      var data = JSON.parse(raw)
+      if (Util.isPlainObject(data) && typeof data.showBuyButton === "boolean") root.showBuyButton = data.showBuyButton
+    } catch (e) { /* keep default */ }
+  }
+
+  // Persisted plugin settings (shared with KeybindsPanel.qml).
   FileView {
     id: buyButtonFile
-    path: Quickshell.env("HOME") + "/.local/state/omarchy/settings/davedes.mouse-keybind-settings.json"
-    watchChanges: false
+    path: root.settingsPath
+    watchChanges: true
+    atomicWrites: true
     printErrors: false
-    onLoaded: {
-      try {
-        var data = JSON.parse(text())
-        if (typeof data.showBuyButton === "boolean") root.showBuyButton = data.showBuyButton
-      } catch (e) { /* keep default */ }
-    }
+    onFileChanged: reload()
+    onLoaded: root.applyPluginSettings(text())
     onLoadFailed: { /* file absent -> use default */ }
   }
+
+  Component.onCompleted: settingsDirProc.running = true
 
   // Keybind panel references
   property var keybindData: ({})
@@ -253,40 +291,14 @@ Panel {
     root.close()
   }
 
-  function requestEditKeybinding(key) {
-    var payload = JSON.stringify({ edit: key || "" })
+  // Summon the full manager with the row to edit. Accepts a model row (preferred,
+  // carries the stable id) or a bare key string for older callers.
+  function requestEditKeybinding(row) {
+    var r = (typeof row === "string") ? { key: row } : (row || {})
+    var payload = JSON.stringify({ edit: r.key || "", id: Model.rowId(r) })
     summonKbProc.command = ["omarchy-shell", "shell", "summon", "davedes.mouse-keybind-settings", payload]
     summonKbProc.running = true
     root.close()
-  }
-
-  // ---- Quick keybind management actions (dropdown list) ----
-
-  function resetKeybinding(key, defaultKey) {
-    kbResetProc.running = false
-    kbResetProc.command = [
-      Quickshell.env("HOME") + "/.config/omarchy/plugins/davedes.mouse-keybind-settings/backend/keybinds_manager.py",
-      "reset", key, defaultKey || ""
-    ]
-    kbResetProc.running = true
-  }
-
-  function enableKeybinding(key) {
-    kbEnableProc.running = false
-    kbEnableProc.command = [
-      Quickshell.env("HOME") + "/.config/omarchy/plugins/davedes.mouse-keybind-settings/backend/keybinds_manager.py",
-      "enable", key
-    ]
-    kbEnableProc.running = true
-  }
-
-  function disableKeybinding(key) {
-    kbDisableProc.running = false
-    kbDisableProc.command = [
-      Quickshell.env("HOME") + "/.config/omarchy/plugins/davedes.mouse-keybind-settings/backend/keybinds_manager.py",
-      "disable", key
-    ]
-    kbDisableProc.running = true
   }
 
   // Periodic poll & initial query
@@ -440,25 +452,6 @@ Panel {
         }
       }
     }
-  }
-
-  // Quick keybind mutation processes (bounded)
-  BoundedProcess {
-    id: kbResetProc
-    timeoutMs: 30000
-    onFinished: root.refreshKeybindData()
-  }
-
-  BoundedProcess {
-    id: kbEnableProc
-    timeoutMs: 30000
-    onFinished: root.refreshKeybindData()
-  }
-
-  BoundedProcess {
-    id: kbDisableProc
-    timeoutMs: 30000
-    onFinished: root.refreshKeybindData()
   }
 
   Timer {
@@ -652,7 +645,7 @@ Panel {
               implicitWidth: Style.space(28)
               implicitHeight: Style.space(28)
               radius: Style.cornerRadius
-              color: editIconHover.hovered ? Style.normalFillFor(root.foreground, root.accent) : "transparent"
+              color: editIconHover.containsMouse ? Style.normalFillFor(root.foreground, root.accent) : "transparent"
               borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
 
               Text {
@@ -1342,15 +1335,15 @@ Panel {
               implicitHeight: Style.space(26)
               implicitWidth: Style.space(110)
               radius: Style.cornerRadius
-              color: resetHover.hovered ? Style.selectedFillFor(root.foreground, root.urgent) : "transparent"
+              color: resetHover.containsMouse ? Style.selectedFillFor(root.foreground, root.urgent) : "transparent"
               borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
 
               RowLayout {
                 anchors.centerIn: parent
                 spacing: 3
 
-                Text { text: "󰁯"; color: resetHover.hovered ? root.urgent : root.foreground; font.family: root.fontFamily }
-                Text { text: "Reset Defaults"; color: resetHover.hovered ? root.urgent : root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                Text { text: "󰁯"; color: resetHover.containsMouse ? root.urgent : root.foreground; font.family: root.fontFamily }
+                Text { text: "Reset Defaults"; color: resetHover.containsMouse ? root.urgent : root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
               }
 
               MouseArea {
@@ -1369,15 +1362,15 @@ Panel {
               implicitHeight: Style.space(26)
               implicitWidth: Style.space(138)
               radius: Style.cornerRadius
-              color: buyHover.hovered ? Util.alpha("#FF813F", 0.22) : Util.alpha("#FF813F", 0.10)
-              borderSpec: Border.controlSpec(buyHover.hovered ? "hover-cursor" : "normal", root.foreground, root.accent)
+              color: buyHover.containsMouse ? Util.alpha("#FF813F", 0.22) : Util.alpha("#FF813F", 0.10)
+              borderSpec: Border.controlSpec(buyHover.containsMouse ? "hover-cursor" : "normal", root.foreground, root.accent)
 
               RowLayout {
                 anchors.centerIn: parent
                 spacing: 3
 
                 Text { text: "☕"; color: "#FF813F"; font.family: root.fontFamily; font.pixelSize: Style.space(13) }
-                Text { text: "Buy Me a Coffee"; color: buyHover.hovered ? "#FFB347" : "#FF813F"; font.family: root.fontFamily; font.pixelSize: Style.font.caption - 1; font.bold: true }
+                Text { text: "Buy Me a Coffee"; color: buyHover.containsMouse ? "#FFB347" : "#FF813F"; font.family: root.fontFamily; font.pixelSize: Style.font.caption - 1; font.bold: true }
               }
 
               MouseArea {
@@ -1685,7 +1678,7 @@ Panel {
                       id: kbActMouse
                       anchors.fill: parent
                       hoverEnabled: true
-                      onClicked: root.requestEditKeybinding(modelData.key)
+                      onClicked: root.requestEditKeybinding(modelData)
                     }
 
                     RowLayout {
@@ -1753,7 +1746,7 @@ Panel {
                         tooltipText: "Modify"
                         horizontalPadding: Style.space(6)
                         verticalPadding: Style.space(3)
-                        onClicked: root.requestEditKeybinding(kbActiveRow.modelData.key)
+                        onClicked: root.requestEditKeybinding(kbActiveRow.modelData)
                       }
                     }
                   }
@@ -1798,7 +1791,7 @@ Panel {
                       id: kbModMouse
                       anchors.fill: parent
                       hoverEnabled: true
-                      onClicked: root.requestEditKeybinding(modelData.key)
+                      onClicked: root.requestEditKeybinding(modelData)
                     }
 
                     RowLayout {
@@ -1861,7 +1854,7 @@ Panel {
                         tooltipText: "Modify"
                         horizontalPadding: Style.space(6)
                         verticalPadding: Style.space(3)
-                        onClicked: root.requestEditKeybinding(kbModRow.modelData.key)
+                        onClicked: root.requestEditKeybinding(kbModRow.modelData)
                       }
                     }
                   }
@@ -2043,8 +2036,8 @@ Panel {
             Layout.fillWidth: true
             implicitHeight: Style.space(40)
             radius: Style.cornerRadius
-            color: launchHover.hovered ? Style.selectedFillFor(root.foreground, root.accent) : Style.normalFillFor(root.foreground, root.accent)
-            borderSpec: Border.controlSpec(launchHover.hovered ? "hover-cursor" : "normal", root.foreground, root.accent)
+            color: launchHover.containsMouse ? Style.selectedFillFor(root.foreground, root.accent) : Style.normalFillFor(root.foreground, root.accent)
+            borderSpec: Border.controlSpec(launchHover.containsMouse ? "hover-cursor" : "normal", root.foreground, root.accent)
 
             RowLayout {
               anchors.centerIn: parent
