@@ -52,7 +52,7 @@ Panel {
   property bool showBuyButton: true
 
   function buyMeACoffeeUrl() {
-    return "https://www.paypal.com/paypalme/DavidDesousa13"
+    return "https://ko-fi.com/davedes"
   }
 
   readonly property string settingsDir: Quickshell.env("HOME") + "/.local/state/omarchy/settings"
@@ -1355,26 +1355,50 @@ Panel {
               }
             }
 
-            // Buy Me a Coffee button (paypal.me/DavidDesousa13); hidden via the
-            // "hide" toggle next to it.
+            // Buy Me a Coffee button (ko-fi.com/davedes); hidden via the
+            // "hide" toggle next to it. Uses the official Ko-fi button art;
+            // falls back to a native styled button if the art can't load.
+            Image {
+              id: kofiButton
+              visible: root.showBuyButton && (kofiButton.status !== Image.Error)
+              Layout.preferredWidth: 143
+              Layout.preferredHeight: 36
+              source: "https://storage.ko-fi.com/cdn/kofi5.png?v=6"
+              sourceSize.height: 72
+              fillMode: Image.PreserveAspectFit
+              smooth: true
+              mipmap: true
+
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  buyProc.running = false
+                  buyProc.command = ["xdg-open", root.buyMeACoffeeUrl()]
+                  buyProc.running = true
+                }
+              }
+            }
+
             BorderSurface {
-              visible: root.showBuyButton
+              visible: root.showBuyButton && (kofiButton.status === Image.Null || kofiButton.status === Image.Loading || kofiButton.status === Image.Error)
               implicitHeight: Style.space(26)
               implicitWidth: Style.space(138)
               radius: Style.cornerRadius
-              color: buyHover.containsMouse ? Util.alpha("#FF813F", 0.22) : Util.alpha("#FF813F", 0.10)
-              borderSpec: Border.controlSpec(buyHover.containsMouse ? "hover-cursor" : "normal", root.foreground, root.accent)
+              color: "transparent"
+              borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
 
-              RowLayout {
+              Text {
                 anchors.centerIn: parent
-                spacing: 3
-
-                Text { text: "☕"; color: "#FF813F"; font.family: root.fontFamily; font.pixelSize: Style.space(13) }
-                Text { text: "Buy Me a Coffee"; color: buyHover.containsMouse ? "#FFB347" : "#FF813F"; font.family: root.fontFamily; font.pixelSize: Style.font.caption - 1; font.bold: true }
+                text: "☕ Buy Me a Coffee"
+                color: "#FF813F"
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption - 1
+                font.bold: true
               }
 
               MouseArea {
-                id: buyHover
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
