@@ -5,15 +5,36 @@
 
 
 
-All in a single toolbar widget with one icon giving you access to both, pointer configuration and Hyprland keybinding management.
+Your mouse feel and your keybindings, tuned from one icon in the bar. No digging through separate settings panels, no guessing why a shortcut silently does nothing.
 
 Plugin ID: `davedes.mouse-keybind-settings`
 
 ## Features
 
-- **Single toolbar icon** — a mouse + keyboard glyph giving access to both mouse settings and keybind manager.
-- **Mouse & Pointer tab**: cursor speed, precision (1:1) vs dynamic acceleration profiles, natural scroll, scroll sensitivity, left-handed mode, focus-follows-cursor, auto-refocus, button remapping, synthetic button press simulation (ydotool), interactive test canvas, and mouse battery indicator.
-- **Keybinds tab**: live summary of active / modified / conflicting keybindings, plus a one-click launcher for the full Keybind Manager (search, edit, create, reset, disable/enable, conflict detection with 1-click rebind, smart free-key recommendations, and safe Lua sync).
+🖱️ Mouse & Pointer
+
+Dial in exactly how your cursor should feel:
+
+* Cursor speed with flat 1:1 precision or dynamic acceleration
+* Natural scroll + sensitivity
+* Left-handed mode
+* Focus-follows-cursor & auto-refocus
+* Full button remapping, including synthetic press simulation (ydotool)
+* Interactive test canvas — feel your changes before you commit
+
+⌨️ Keybinds
+
+See what's actually running on your system, fix problems in one click:
+
+* Live summary of active, modified, and conflicting bindings
+* Conflict detection with 1-click rebind
+* Smart suggestions for free keys
+* Full Keybind Manager one click away — search, edit, create, reset, enable/disable
+* Safe Lua sync, so your config never gets messy
+  
+Why bother?
+
+Because "just tweaking cursor speed real quick" shouldn't turn into a five-minute detour, and keybind conflicts shouldn't be something you discover by accident. One icon, both problems solved.
 
 ## Installation
 
