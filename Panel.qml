@@ -696,6 +696,28 @@ Panel {
               spacing: Style.space(8)
               Layout.alignment: Qt.AlignTop
 
+            // --- MIRROR ---
+            ColumnLayout {
+              Layout.fillWidth: true
+              spacing: Style.space(8)
+
+              Text {
+                text: "Mirror"
+                color: root.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.subtitle
+                font.bold: true
+              }
+
+              Toggle {
+                Layout.fillWidth: true
+                label: "Apply to Trackpad"
+                description: "Mirror these settings to the touchpad"
+                checked: root.status.apply_to_trackpad
+                onClicked: root.applySettings({ apply_to_trackpad: !root.status.apply_to_trackpad })
+              }
+            }
+
             // --- MOTION ---
             ColumnLayout {
               Layout.fillWidth: true
