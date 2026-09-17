@@ -426,9 +426,9 @@ def read_plugin_settings() -> dict:
 
 def apply_to_trackpad_enabled() -> bool:
     """Whether mouse changes should also be applied to the touchpad.
-    Defaults to True; falls back to the plugin settings JSON's
-    `apply_to_trackpad` key when present."""
-    return validate_bool(read_plugin_settings().get("apply_to_trackpad"), True)
+    Opt-in: defaults to False; enabled only when the plugin settings JSON
+    has `apply_to_trackpad` set True."""
+    return validate_bool(read_plugin_settings().get("apply_to_trackpad"), False)
 
 def set_plugin_setting(key: str, value) -> bool:
     """Merge key/value into the plugin settings JSON (read-modify-write),
@@ -862,7 +862,11 @@ def main():
                 "left_handed": False,
                 "scroll_factor": 1.0,
                 "mouse_refocus": True,
+                "apply_to_trackpad": False,
             }
+            if not set_plugin_setting("apply_to_trackpad", False):
+                print(json.dumps({"success": False, "error": "Failed to persist Apply to Trackpad preference"}))
+                return
             apply_hypr_eval(defaults)
             ok, err = _commit_changes(
                 [INPUT_LUA_PATH, BINDINGS_LUA_PATH],
@@ -913,7 +917,9 @@ def main():
                     if "apply_to_trackpad" in payload:
                         val = validate_bool(payload["apply_to_trackpad"], current["apply_to_trackpad"])
                         current["apply_to_trackpad"] = val
-                        set_plugin_setting("apply_to_trackpad", val)
+                        if not set_plugin_setting("apply_to_trackpad", val):
+                            print(json.dumps({"success": False, "error": "Failed to persist Apply to Trackpad preference"}))
+                            return
                         has_input_change = True
                     if "button_mappings" in payload and isinstance(payload["button_mappings"], dict):
                         bm = payload["button_mappings"]

@@ -257,6 +257,15 @@ Panel {
 
   property double lastSimMs: 0
 
+  property double lastTrackpadToggleMs: 0
+
+  function toggleTrackpadMirror() {
+    var now = Date.now()
+    if (now - lastTrackpadToggleMs < 300) return
+    lastTrackpadToggleMs = now
+    root.applySettings({ apply_to_trackpad: !root.status.apply_to_trackpad })
+  }
+
   function simLabel(name) {
     if (name === "left") return "Left Btn"
     if (name === "right") return "Right Btn"
@@ -355,8 +364,10 @@ Panel {
           var data = JSON.parse(output)
           if (data.success) {
             root.lastActionNote = "Saved"
+            if (data.status) root.status = data.status
           } else {
             root.lastActionNote = data.error ? "Error" : "Failed"
+            if (data.status) root.status = data.status
           }
         } catch (e) {
           root.lastActionNote = "Saved"
@@ -714,7 +725,7 @@ Panel {
                 label: "Apply to Trackpad"
                 description: "Mirror these settings to the touchpad"
                 checked: root.status.apply_to_trackpad
-                onClicked: root.applySettings({ apply_to_trackpad: !root.status.apply_to_trackpad })
+                onClicked: root.toggleTrackpadMirror()
               }
             }
 
