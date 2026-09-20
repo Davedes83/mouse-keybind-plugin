@@ -1,4 +1,6 @@
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/O3N726LJT4)
+
+Like the plugin? ♥️ it on the Omarchy Marketplace to help others find it.
 # Mouse & Keybind Plugin
 
 <img width="799" height="446" alt="Mouse   Keybind Settings" src="https://github.com/user-attachments/assets/3ab1498b-56fb-4fcc-b5c4-7d53f245fcf4" />
