@@ -934,11 +934,59 @@ Panel {
                 }
               }
 
-              Toggle {
+              ColumnLayout {
                 Layout.fillWidth: true
-                label: "Focus Follows Cursor"
-                checked: root.status.follow_mouse > 0
-                onClicked: root.applySettings({ follow_mouse: root.status.follow_mouse > 0 ? 0 : 1 })
+                spacing: Style.space(4)
+
+                Text {
+                  text: "Focus Follows Cursor"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.subtitle
+                  font.bold: true
+                }
+
+                GridLayout {
+                  Layout.fillWidth: true
+                  columns: 2
+                  columnSpacing: Style.space(6)
+                  rowSpacing: Style.space(6)
+
+                  Repeater {
+                    model: [
+                      { mode: 0, icon: "🚫", title: "No Follow", sub: "Cursor never moves focus" },
+                      { mode: 1, icon: "🖱", title: "Normal", sub: "Focus follows mouse (default)" },
+                      { mode: 2, icon: "🔎", title: "Detached", sub: "Hover freely; click steers focus" },
+                      { mode: 3, icon: "⛶", title: "Full", sub: "Focus and workspace track cursor" }
+                    ]
+
+                    BorderSurface {
+                      Layout.fillWidth: true
+                      implicitHeight: Style.space(54)
+                      radius: Style.cornerRadius
+                      color: root.status.follow_mouse === modelData.mode ? Style.selectedFillFor(root.foreground, root.accent) : Style.normalFillFor(root.foreground, root.accent)
+                      borderSpec: Border.controlSpec(root.status.follow_mouse === modelData.mode ? "selected" : "normal", root.foreground, root.accent)
+
+                      ColumnLayout {
+                        anchors.centerIn: parent
+                        spacing: 1
+
+                        RowLayout {
+                          spacing: 3
+                          Text { text: modelData.icon; color: root.foreground; font.family: root.fontFamily }
+                          Text { text: modelData.title; color: root.foreground; font.bold: true; font.family: root.fontFamily; font.pixelSize: Style.font.caption - 1 }
+                        }
+                        Text { text: modelData.sub; color: root.dim; font.pixelSize: Style.space(8); font.family: root.fontFamily }
+                      }
+
+                      MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.applySettings({ follow_mouse: modelData.mode })
+                      }
+                    }
+                  }
+                }
               }
 
               Toggle {

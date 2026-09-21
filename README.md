@@ -20,7 +20,7 @@ Dial in exactly how your cursor should feel:
 * Cursor speed with flat 1:1 precision or dynamic acceleration
 * Natural scroll + sensitivity
 * Left-handed mode
-* Focus-follows-cursor & auto-refocus
+* Focus-follows-cursor with all 4 modes (normal, detached, full) & auto-refocus
 * Full button remapping, including synthetic press simulation (ydotool)
 * Interactive test canvas — feel your changes before you commit
 

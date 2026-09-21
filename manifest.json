@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "davedes.mouse-keybind-settings",
   "name": "Mouse & Keybind Settings",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "davedes",
   "license": "MIT",
   "description": "Combined graphical configuration for mouse/pointer settings and Hyprland keybindings — cursor speed, acceleration profiles, scroll behavior, button remapping, synthetic button presses, battery indicator, and full keybind manager.",
