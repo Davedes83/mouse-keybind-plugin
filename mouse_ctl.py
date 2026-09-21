@@ -34,6 +34,7 @@ MAX_CONFIG_READ_BYTES = 1_048_576
 INPUT_LUA_PATH = Path.home() / ".config" / "hypr" / "input.lua"
 BINDINGS_LUA_PATH = Path.home() / ".config" / "hypr" / "bindings.lua"
 LOCK_PATH = Path.home() / ".config" / "hypr" / ".mouse_ctl.lock"
+PLUGIN_SETTINGS_PATH = Path.home() / ".local" / "state" / "omarchy" / "settings" / "davedes.mouse-keybind-settings.json"
 
 START_MARKER = "-- [[ OMARCHY_MOUSE_SETTINGS_START ]]"
 END_MARKER = "-- [[ OMARCHY_MOUSE_SETTINGS_END ]]"
@@ -410,6 +411,41 @@ def validate_button_mapping(button: str, action: str) -> str:
         return str(action)
     return default
 
+def read_plugin_settings() -> dict:
+    """Read the plugin's shared settings JSON (state dir). Fail-closed to an
+    empty dict on any read/parse problem; never raises."""
+    try:
+        content = safe_read_file(PLUGIN_SETTINGS_PATH)
+    except (FileNotFoundError, ValueError, UnicodeDecodeError, OSError):
+        return {}
+    try:
+        data = json.loads(content)
+    except (ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+def apply_to_trackpad_enabled() -> bool:
+    """Whether mouse changes should also be applied to the touchpad.
+    Opt-in: defaults to False; enabled only when the plugin settings JSON
+    has `apply_to_trackpad` set True."""
+    return validate_bool(read_plugin_settings().get("apply_to_trackpad"), False)
+
+def set_plugin_setting(key: str, value) -> bool:
+    """Merge key/value into the plugin settings JSON (read-modify-write),
+    preserving unowned keys. Returns True on success; never raises."""
+    settings = read_plugin_settings()
+    settings[key] = value
+    try:
+        PLUGIN_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    try:
+        content = json.dumps(settings, indent=2) + "\n"
+        safe_atomic_write(PLUGIN_SETTINGS_PATH, content, 0o600)
+    except (ValueError, OSError):
+        return False
+    return True
+
 def get_hypr_option(opt_name):
     code, out, _ = run_cmd(["hyprctl", "getoption", opt_name, "-j"])
     if code != 0 or not out:
@@ -574,6 +610,7 @@ def get_current_status():
         "devices": devices,
         "primaryDevice": devices[0]["name"] if devices else "Standard Mouse",
         "battery": get_battery(devices[0]["name"] if devices else ""),
+        "apply_to_trackpad": apply_to_trackpad_enabled(),
         "sensitivity": sensitivity,
         "accel_profile": accel_profile,
         "is_flat": (accel_profile == "flat"),
@@ -594,17 +631,19 @@ def apply_hypr_eval(settings) -> bool:
     left_handed = "true" if validate_bool(settings.get("left_handed"), False) else "false"
     scroll_factor = validate_float(settings.get("scroll_factor"), 1.0, 0.1, 8.0)
     mouse_refocus = "true" if validate_bool(settings.get("mouse_refocus"), True) else "false"
-    lua_cmd = (
-        f"hl.config({{ input = {{ "
-        f"sensitivity = {sensitivity:.2f}, "
-        f"accel_profile = {accel_lua}, "
-        f"follow_mouse = {follow_mouse}, "
-        f"natural_scroll = {natural_scroll}, "
-        f"left_handed = {left_handed}, "
-        f"scroll_factor = {scroll_factor:.2f}, "
-        f"mouse_refocus = {mouse_refocus} "
-        f"}} }})"
-    )
+    apply_to_trackpad = validate_bool(settings.get("apply_to_trackpad"), apply_to_trackpad_enabled())
+    pieces = [
+        f"sensitivity = {sensitivity:.2f}",
+        f"accel_profile = {accel_lua}",
+        f"follow_mouse = {follow_mouse}",
+        f"natural_scroll = {natural_scroll}",
+        f"left_handed = {left_handed}",
+        f"scroll_factor = {scroll_factor:.2f}",
+        f"mouse_refocus = {mouse_refocus}",
+    ]
+    if apply_to_trackpad:
+        pieces.append(f"touchpad = {{ natural_scroll = {natural_scroll}, scroll_factor = {scroll_factor:.2f} }}")
+    lua_cmd = f"hl.config({{ input = {{ " + ", ".join(pieces) + " } })"
     code, out, err = run_cmd(["hyprctl", "eval", lua_cmd])
     return code == 0
 
@@ -621,6 +660,15 @@ def persist_to_input_lua(settings) -> bool:
     left_handed = "true" if validate_bool(settings.get("left_handed"), False) else "false"
     scroll_factor = validate_float(settings.get("scroll_factor"), 1.0, 0.1, 8.0)
     mouse_refocus = "true" if validate_bool(settings.get("mouse_refocus"), True) else "false"
+    apply_to_trackpad = validate_bool(settings.get("apply_to_trackpad"), apply_to_trackpad_enabled())
+    touchpad_lines = ""
+    if apply_to_trackpad:
+        touchpad_lines = (
+            f"    touchpad = {{\n"
+            f"      natural_scroll = {natural_scroll},\n"
+            f"      scroll_factor = {scroll_factor:.2f},\n"
+            f"    }},\n"
+        )
     new_block = (
         f"{START_MARKER}\n"
         f"hl.config({{\n"
@@ -632,6 +680,7 @@ def persist_to_input_lua(settings) -> bool:
         f"    left_handed = {left_handed},\n"
         f"    scroll_factor = {scroll_factor:.2f},\n"
         f"    mouse_refocus = {mouse_refocus},\n"
+        f"{touchpad_lines}"
         f"  }},\n"
         f"}})\n"
         f"{END_MARKER}"
@@ -813,7 +862,11 @@ def main():
                 "left_handed": False,
                 "scroll_factor": 1.0,
                 "mouse_refocus": True,
+                "apply_to_trackpad": False,
             }
+            if not set_plugin_setting("apply_to_trackpad", False):
+                print(json.dumps({"success": False, "error": "Failed to persist Apply to Trackpad preference"}))
+                return
             apply_hypr_eval(defaults)
             ok, err = _commit_changes(
                 [INPUT_LUA_PATH, BINDINGS_LUA_PATH],
@@ -860,6 +913,13 @@ def main():
                         has_input_change = True
                     if "mouse_refocus" in payload:
                         current["mouse_refocus"] = validate_bool(payload["mouse_refocus"], current["mouse_refocus"])
+                        has_input_change = True
+                    if "apply_to_trackpad" in payload:
+                        val = validate_bool(payload["apply_to_trackpad"], current["apply_to_trackpad"])
+                        current["apply_to_trackpad"] = val
+                        if not set_plugin_setting("apply_to_trackpad", val):
+                            print(json.dumps({"success": False, "error": "Failed to persist Apply to Trackpad preference"}))
+                            return
                         has_input_change = True
                     if "button_mappings" in payload and isinstance(payload["button_mappings"], dict):
                         bm = payload["button_mappings"]

@@ -2,6 +2,7 @@
 """Backend tests. Everything runs against a temp HOME with a fixture stock
 directory and a fake hyprctl; the real ~/.config/hypr/bindings.lua is only
 ever COPIED (never written) and `hyprctl reload` never runs for real."""
+import io
 import json
 import os
 import re
@@ -10,10 +11,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "backend"))
 sys.path.insert(0, BACKEND_DIR)
 import keybinds_manager as km  # noqa: E402
+
+REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, REPO_DIR)
+import mouse_ctl as mc  # noqa: E402
 
 REAL_USER_FILE = os.path.join(os.path.expanduser("~"), ".config", "hypr", "bindings.lua")
 
@@ -667,7 +673,11 @@ class TestRealFileCopy(Base):
     def test_hand_written_lines_never_rewritten(self):
         m = km.build_complete_model()
         self.assertGreater(m["total_active"], 20)
-        self.assertGreater(len(km.parse_user_file()["binds"]), 5)
+        # The user file's hand-written binds vary (a stock config may hold just
+        # the mouse mappings), so check the parser output is well-formed rather
+        # than pinned to an arbitrary count.
+        user_binds = km.parse_user_file()["binds"]
+        self.assertTrue(all(b.get("key") and b.get("description") and b.get("action") for b in user_binds))
         # 1. shadow a hand-written bind
         res = km.set_keybinding("SUPER + SHIFT + Q", "Close window", "hl.dsp.window.close()")
         self.assertTrue(res["success"], res)
@@ -734,6 +744,112 @@ class TestCLI(Base):
         with open(self.log) as f:
             log = f.read()
         self.assertIn("hyprctl reload", log)
+
+
+class TestMouseCtlTrackpad(Base):
+    """Apply-to-Trackpad mirror behavior in mouse_ctl.py. The HOME-relative
+    target paths are overridden to temp files so nothing touches the real
+    user config, and a fake hyprctl is prepended to PATH for commands that
+    shell out."""
+
+    def setUp(self):
+        super().setUp()
+        self.saved_mc = (mc.INPUT_LUA_PATH, mc.BINDINGS_LUA_PATH, mc.PLUGIN_SETTINGS_PATH, mc.LOCK_PATH)
+        self.path_backup = os.environ.get("PATH")
+        self.input_lua = os.path.join(self.hypr_dir, "input.lua")
+        self.settings_path = os.path.join(self.tmp, "state", "omarchy", "settings", "davedes.mouse-keybind-settings.json")
+        mc.INPUT_LUA_PATH = Path(self.input_lua)
+        mc.BINDINGS_LUA_PATH = Path(os.path.join(self.hypr_dir, "bindings.lua"))
+        mc.PLUGIN_SETTINGS_PATH = Path(self.settings_path)
+        mc.LOCK_PATH = Path(self.hypr_dir) / ".mouse_ctl.lock"
+        self.fakebin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.fakebin)
+        self.fake_hyprctl = os.path.join(self.fakebin, "hyprctl")
+        with open(self.fake_hyprctl, "w") as f:
+            f.write(FAKE_HYPRCTL)
+        os.chmod(self.fake_hyprctl, 0o755)
+        os.environ["PATH"] = self.fakebin + os.pathsep + (self.path_backup or "")
+
+    def tearDown(self):
+        mc.INPUT_LUA_PATH, mc.BINDINGS_LUA_PATH, mc.PLUGIN_SETTINGS_PATH, mc.LOCK_PATH = self.saved_mc
+        if self.path_backup is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = self.path_backup
+        super().tearDown()
+
+    def read_input_lua(self):
+        with open(self.input_lua) as f:
+            return f.read()
+
+    def test_mirror_defaults_to_opt_out(self):
+        self.assertFalse(mc.apply_to_trackpad_enabled())
+
+    def test_mirror_opt_out_on_corrupt_settings_file(self):
+        os.makedirs(os.path.dirname(self.settings_path))
+        with open(self.settings_path, "w") as f:
+            f.write("{ not valid json")
+        self.assertFalse(mc.apply_to_trackpad_enabled())
+
+    def test_mirror_setting_roundtrip_preserves_other_keys(self):
+        self.assertTrue(mc.set_plugin_setting("other_key", 42))
+        self.assertTrue(mc.set_plugin_setting("apply_to_trackpad", True))
+        self.assertTrue(mc.apply_to_trackpad_enabled())
+        self.assertTrue(mc.set_plugin_setting("apply_to_trackpad", False))
+        self.assertFalse(mc.apply_to_trackpad_enabled())
+        self.assertEqual(mc.read_plugin_settings().get("other_key"), 42)
+
+    def test_persist_omits_touchpad_when_off(self):
+        mc.persist_to_input_lua({"apply_to_trackpad": False, "natural_scroll": False})
+        content = self.read_input_lua()
+        self.assertNotIn("touchpad", content)
+        self.assertIn("natural_scroll = false", content)
+
+    def test_persist_adds_touchpad_when_on(self):
+        mc.persist_to_input_lua({"apply_to_trackpad": True, "natural_scroll": True, "scroll_factor": 2.5})
+        content = self.read_input_lua()
+        touch_block = re.search(r"touchpad = \{(.*?)\}", content, re.DOTALL).group(1)
+        self.assertIn("natural_scroll = true", touch_block)
+        self.assertIn("scroll_factor = 2.50", touch_block)
+
+    def test_persist_off_removes_stale_touchpad_block(self):
+        mc.persist_to_input_lua({"apply_to_trackpad": True})
+        self.assertIn("touchpad", mc.safe_read_file(mc.INPUT_LUA_PATH))
+        mc.persist_to_input_lua({"apply_to_trackpad": False})
+        self.assertNotIn("touchpad", mc.safe_read_file(mc.INPUT_LUA_PATH))
+
+    def test_reset_defaults_disables_trackpad_mirror(self):
+        mc.set_plugin_setting("apply_to_trackpad", True)
+        mc.persist_to_input_lua({"apply_to_trackpad": True})
+        self.assertIn("touchpad", mc.safe_read_file(mc.INPUT_LUA_PATH))
+        saved_argv = list(sys.argv)
+        saved_stdout = sys.stdout
+        sys.argv = ["mouse_ctl.py", "reset-defaults"]
+        try:
+            sys.stdout = io.StringIO()
+            mc.main()
+        finally:
+            sys.stdout = saved_stdout
+            sys.argv = saved_argv
+        self.assertFalse(mc.apply_to_trackpad_enabled())
+        self.assertNotIn("touchpad", mc.safe_read_file(mc.INPUT_LUA_PATH))
+
+    def test_reset_defaults_fails_when_preference_cannot_persist(self):
+        os.makedirs(self.settings_path)  # a directory where the JSON file must be
+        saved_argv = list(sys.argv)
+        saved_stdout = sys.stdout
+        sys.argv = ["mouse_ctl.py", "reset-defaults"]
+        buf = io.StringIO()
+        try:
+            sys.stdout = buf
+            mc.main()
+        finally:
+            sys.stdout = saved_stdout
+            sys.argv = saved_argv
+        result = json.loads(buf.getvalue())
+        self.assertFalse(result["success"])
+        self.assertIn("persist", result["error"])
+        self.assertFalse(os.path.exists(self.input_lua))  # nothing applied
 
 
 if __name__ == "__main__":
