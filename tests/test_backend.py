@@ -754,14 +754,18 @@ class TestMouseCtlTrackpad(Base):
 
     def setUp(self):
         super().setUp()
-        self.saved_mc = (mc.INPUT_LUA_PATH, mc.BINDINGS_LUA_PATH, mc.PLUGIN_SETTINGS_PATH, mc.LOCK_PATH)
+        self.saved_mc = (mc.INPUT_LUA_PATH, mc.BINDINGS_LUA_PATH, mc.HYPRLAND_LUA_PATH, mc.PLUGIN_SETTINGS_PATH, mc.LOCK_PATH)
         self.path_backup = os.environ.get("PATH")
         self.input_lua = os.path.join(self.hypr_dir, "input.lua")
+        self.hyprland_lua = os.path.join(self.hypr_dir, "hyprland.lua")
         self.settings_path = os.path.join(self.tmp, "state", "omarchy", "settings", "davedes.mouse-keybind-settings.json")
         mc.INPUT_LUA_PATH = Path(self.input_lua)
         mc.BINDINGS_LUA_PATH = Path(os.path.join(self.hypr_dir, "bindings.lua"))
+        mc.HYPRLAND_LUA_PATH = Path(self.hyprland_lua)
         mc.PLUGIN_SETTINGS_PATH = Path(self.settings_path)
         mc.LOCK_PATH = Path(self.hypr_dir) / ".mouse_ctl.lock"
+        with open(self.hyprland_lua, "w") as f:
+            f.write('-- user config\nrequire("hypr.omasettings")\n')
         self.fakebin = os.path.join(self.tmp, "bin")
         os.makedirs(self.fakebin)
         self.fake_hyprctl = os.path.join(self.fakebin, "hyprctl")
@@ -771,7 +775,7 @@ class TestMouseCtlTrackpad(Base):
         os.environ["PATH"] = self.fakebin + os.pathsep + (self.path_backup or "")
 
     def tearDown(self):
-        mc.INPUT_LUA_PATH, mc.BINDINGS_LUA_PATH, mc.PLUGIN_SETTINGS_PATH, mc.LOCK_PATH = self.saved_mc
+        mc.INPUT_LUA_PATH, mc.BINDINGS_LUA_PATH, mc.HYPRLAND_LUA_PATH, mc.PLUGIN_SETTINGS_PATH, mc.LOCK_PATH = self.saved_mc
         if self.path_backup is None:
             os.environ.pop("PATH", None)
         else:
@@ -850,6 +854,64 @@ class TestMouseCtlTrackpad(Base):
         self.assertFalse(result["success"])
         self.assertIn("persist", result["error"])
         self.assertFalse(os.path.exists(self.input_lua))  # nothing applied
+
+    def read_hyprland_lua(self):
+        with open(self.hyprland_lua) as f:
+            return f.read()
+
+    def test_tail_block_appended_after_omasettings(self):
+        mc.persist_to_hyprland_tail({"follow_mouse": 2})
+        content = self.read_hyprland_lua()
+        self.assertGreater(content.index("OMARCHY_MOUSE_SETTINGS_START"), content.index("omasettings"))
+        self.assertIn("follow_mouse = 2", content)
+
+    def test_tail_block_upserted_in_place(self):
+        mc.persist_to_hyprland_tail({"follow_mouse": 2})
+        mc.persist_to_hyprland_tail({"follow_mouse": 0})
+        content = self.read_hyprland_lua()
+        self.assertEqual(content.count("OMARCHY_MOUSE_SETTINGS_START"), 1)
+        self.assertNotIn("follow_mouse = 2", content)
+        self.assertIn("follow_mouse = 0", content)
+
+    def test_clear_tail_removes_block(self):
+        mc.persist_to_hyprland_tail({"follow_mouse": 2})
+        self.assertIn("OMARCHY_MOUSE_SETTINGS_START", self.read_hyprland_lua())
+        self.assertTrue(mc.clear_hyprland_tail())
+        self.assertNotIn("OMARCHY_MOUSE_SETTINGS_START", self.read_hyprland_lua())
+        self.assertIn("require(\"hypr.omasettings\")", self.read_hyprland_lua())
+
+    def test_reset_defaults_clears_tail(self):
+        mc.persist_to_hyprland_tail({"follow_mouse": 2})
+        saved_argv = list(sys.argv)
+        saved_stdout = sys.stdout
+        sys.argv = ["mouse_ctl.py", "reset-defaults"]
+        buf = io.StringIO()
+        try:
+            sys.stdout = buf
+            mc.main()
+        finally:
+            sys.stdout = saved_stdout
+            sys.argv = saved_argv
+        result = json.loads(buf.getvalue())
+        self.assertTrue(result["success"])
+        self.assertNotIn("OMARCHY_MOUSE_SETTINGS_START", self.read_hyprland_lua())
+
+    def test_apply_follow_mouse_mode_persists_block_and_tail(self):
+        saved_argv = list(sys.argv)
+        saved_stdout = sys.stdout
+        sys.argv = ["mouse_ctl.py", "apply", "--json-data", json.dumps({"follow_mouse": 2})]
+        buf = io.StringIO()
+        try:
+            sys.stdout = buf
+            mc.main()
+        finally:
+            sys.stdout = saved_stdout
+            sys.argv = saved_argv
+        result = json.loads(buf.getvalue())
+        self.assertTrue(result["success"])
+        self.assertEqual(result["status"]["follow_mouse"], 2)
+        self.assertIn("follow_mouse = 2", self.read_input_lua())
+        self.assertIn("follow_mouse = 2", self.read_hyprland_lua())
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ MAX_CONFIG_READ_BYTES = 1_048_576
 
 INPUT_LUA_PATH = Path.home() / ".config" / "hypr" / "input.lua"
 BINDINGS_LUA_PATH = Path.home() / ".config" / "hypr" / "bindings.lua"
+HYPRLAND_LUA_PATH = Path.home() / ".config" / "hypr" / "hyprland.lua"
 LOCK_PATH = Path.home() / ".config" / "hypr" / ".mouse_ctl.lock"
 PLUGIN_SETTINGS_PATH = Path.home() / ".local" / "state" / "omarchy" / "settings" / "davedes.mouse-keybind-settings.json"
 
@@ -647,11 +648,8 @@ def apply_hypr_eval(settings) -> bool:
     code, out, err = run_cmd(["hyprctl", "eval", lua_cmd])
     return code == 0
 
-def persist_to_input_lua(settings) -> bool:
-    try:
-        original_content = safe_read_file(INPUT_LUA_PATH)
-    except FileNotFoundError:
-        original_content = "-- User input overrides\n"
+def build_mouse_block(settings) -> str:
+    """Render the managed mouse-settings hl.config block (marker-wrapped)."""
     sensitivity = validate_float(settings.get("sensitivity"), 0.0, -1.0, 1.0)
     accel = validate_accel_profile(settings.get("accel_profile", "adaptive"))
     accel_lua = f'"{accel}"' if accel in ("flat", "adaptive", "custom") else '""'
@@ -669,7 +667,7 @@ def persist_to_input_lua(settings) -> bool:
             f"      scroll_factor = {scroll_factor:.2f},\n"
             f"    }},\n"
         )
-    new_block = (
+    return (
         f"{START_MARKER}\n"
         f"hl.config({{\n"
         f"  input = {{\n"
@@ -685,14 +683,53 @@ def persist_to_input_lua(settings) -> bool:
         f"}})\n"
         f"{END_MARKER}"
     )
+
+def _replace_or_append_block(original_content: str, new_block: str) -> str:
     if START_MARKER in original_content and END_MARKER in original_content:
         pattern = re.compile(re.escape(START_MARKER) + r".*?" + re.escape(END_MARKER), re.DOTALL)
-        updated_content = pattern.sub(new_block, original_content)
-    else:
-        updated_content = original_content.rstrip() + "\n\n" + new_block + "\n"
+        return pattern.sub(new_block, original_content)
+    return original_content.rstrip() + "\n\n" + new_block + "\n"
+
+def persist_to_input_lua(settings) -> bool:
+    try:
+        original_content = safe_read_file(INPUT_LUA_PATH)
+    except FileNotFoundError:
+        original_content = "-- User input overrides\n"
+    new_block = build_mouse_block(settings)
+    updated_content = _replace_or_append_block(original_content, new_block)
     if updated_content == original_content:
         return False
     safe_atomic_write(INPUT_LUA_PATH, updated_content)
+    return True
+
+def persist_to_hyprland_tail(settings) -> bool:
+    """Re-assert the mouse block at the very end of hyprland.lua so it loads
+    AFTER OmaSettings (which re-applies input.follow_mouse/touchpad on every
+    reload, clobbering the input.lua block). Last write wins at runtime."""
+    try:
+        original_content = safe_read_file(HYPRLAND_LUA_PATH)
+    except FileNotFoundError:
+        original_content = "-- Omarchy user Hyprland config\n"
+    new_block = build_mouse_block(settings)
+    updated_content = _replace_or_append_block(original_content, new_block)
+    if updated_content == original_content:
+        return False
+    safe_atomic_write(HYPRLAND_LUA_PATH, updated_content)
+    return True
+
+def clear_hyprland_tail() -> bool:
+    """Remove the managed mouse block from the end of hyprland.lua."""
+    try:
+        original_content = safe_read_file(HYPRLAND_LUA_PATH)
+    except FileNotFoundError:
+        return False
+    if START_MARKER not in original_content and END_MARKER not in original_content:
+        return False
+    pattern = re.compile(r"\n*" + re.escape(START_MARKER) + r".*?" + re.escape(END_MARKER) + r"\n*", re.DOTALL)
+    updated_content = pattern.sub("\n", original_content)
+    if updated_content == original_content:
+        return False
+    safe_atomic_write(HYPRLAND_LUA_PATH, updated_content)
     return True
 
 def persist_to_bindings_lua(mappings) -> bool:
@@ -830,7 +867,10 @@ def main():
             current["accel_profile"] = new_profile
             current["is_flat"] = (new_profile == "flat")
             apply_hypr_eval(current)
-            ok, err = _commit_changes([INPUT_LUA_PATH], lambda: persist_to_input_lua(current))
+            ok, err = _commit_changes(
+                [INPUT_LUA_PATH, HYPRLAND_LUA_PATH],
+                lambda: (persist_to_input_lua(current), persist_to_hyprland_tail(current)),
+            )
             label = "Precision (Raw 1:1)" if new_profile == "flat" else "Desktop (Dynamic)"
             if not ok:
                 print(json.dumps({"success": False, "error": err}))
@@ -844,7 +884,10 @@ def main():
             new_val = not current["natural_scroll"]
             current["natural_scroll"] = new_val
             apply_hypr_eval(current)
-            ok, err = _commit_changes([INPUT_LUA_PATH], lambda: persist_to_input_lua(current))
+            ok, err = _commit_changes(
+                [INPUT_LUA_PATH, HYPRLAND_LUA_PATH],
+                lambda: (persist_to_input_lua(current), persist_to_hyprland_tail(current)),
+            )
             label = "Natural (Mobile)" if new_val else "Traditional (Classic PC)"
             if not ok:
                 print(json.dumps({"success": False, "error": err}))
@@ -869,8 +912,8 @@ def main():
                 return
             apply_hypr_eval(defaults)
             ok, err = _commit_changes(
-                [INPUT_LUA_PATH, BINDINGS_LUA_PATH],
-                lambda: (persist_to_input_lua(defaults), persist_to_bindings_lua(DEFAULT_BUTTON_MAPPINGS)),
+                [INPUT_LUA_PATH, BINDINGS_LUA_PATH, HYPRLAND_LUA_PATH],
+                lambda: (persist_to_input_lua(defaults), persist_to_bindings_lua(DEFAULT_BUTTON_MAPPINGS), clear_hyprland_tail()),
             )
             if not ok:
                 print(json.dumps({"success": False, "error": err}))
@@ -938,7 +981,9 @@ def main():
             write_ops = []
             if has_input_change:
                 change_paths.append(INPUT_LUA_PATH)
+                change_paths.append(HYPRLAND_LUA_PATH)
                 write_ops.append(lambda: persist_to_input_lua(current))
+                write_ops.append(lambda: persist_to_hyprland_tail(current))
                 eval_ok = apply_hypr_eval(current)
             if has_bindings_change:
                 change_paths.append(BINDINGS_LUA_PATH)
