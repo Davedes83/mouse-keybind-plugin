@@ -22,6 +22,13 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color accent: Color.accent
 
+  // The bar icon shows two glyphs (mouse + keyboard). Each is drawn at the
+  // normal bar-icon optical size so they match their neighbours; the pair is
+  // only wider, not smaller. Clamped so both still fit inside one icon slot
+  // if a theme enlarges `icon-size`.
+  readonly property real barPairGlyphSize: Math.min(Style.bar.iconSize,
+    (Style.bar.iconSlot - Style.space(1)) / 2)
+
   // Mouse settings state
   property var status: ({
     devices: [],
@@ -476,7 +483,13 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰍽"
+    // Both glyphs are kept, but drawn below instead of via BarIconButton's
+    // `text`. That path fits a string's whole painted box into one iconSize
+    // square; a pair is ~2x wider than tall, so it was fitted by width and
+    // rendered at half its neighbours' height. Two single-glyph OpticalGlyphs
+    // in their own boxes keep full optical size and only take more width.
+    text: ""
+    hasVisualContent: true
     tooltipText: "Mouse & Keybind Settings"
     active: root.status && root.status.accel_profile === "flat"
     onPressed: function(buttonCode) {
@@ -484,6 +497,32 @@ Panel {
         root.toggleAccelMode()
       } else {
         root.toggle()
+      }
+    }
+
+    Row {
+      anchors.centerIn: parent
+      spacing: Style.space(1)
+      scale: button.pressScale
+
+      OpticalGlyph {
+        width: root.barPairGlyphSize
+        height: root.barPairGlyphSize
+        text: "󰍽"
+        fontFamily: root.fontFamily
+        fontSize: Style.bar.iconFont
+        paintedSize: Style.bar.iconSize
+        color: button.active && button.useActiveColor ? button.activeColor : root.foreground
+      }
+
+      OpticalGlyph {
+        width: root.barPairGlyphSize
+        height: root.barPairGlyphSize
+        text: ""
+        fontFamily: root.fontFamily
+        fontSize: Style.bar.iconFont
+        paintedSize: Style.bar.iconSize
+        color: button.active && button.useActiveColor ? button.activeColor : root.foreground
       }
     }
   }
