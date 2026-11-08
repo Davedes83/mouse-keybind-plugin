@@ -1483,7 +1483,11 @@ Panel {
               visible: root.showBuyButton && (kofiButton.status !== Image.Error)
               Layout.preferredWidth: 143
               Layout.preferredHeight: 36
-              source: "https://storage.ko-fi.com/cdn/kofi5.png?v=6"
+              // Bundled locally (assets/kofi-button.png) instead of loading the
+              // mutable Ko-fi CDN PNG over HTTPS. A compromised CDN origin or TLS
+              // intermediary could serve a PNG whose compressed-text chunks cause
+              // unbounded libpng memory growth; sourceSize does not bound that.
+              source: Qt.resolvedUrl("assets/kofi-button.png")
               sourceSize.height: 72
               fillMode: Image.PreserveAspectFit
               smooth: true
