@@ -37,6 +37,8 @@ Item {
   property int exitCodeData: -1
   property int exitStatusData: -1
   property bool finishedData: false
+  property bool startPendingData: false
+  property bool cancelPendingData: false
 
   onRunningChanged: {
     if (root.running) {
@@ -54,11 +56,16 @@ Item {
   Process {
     id: proc
     stdout: SplitParser {
+      // Deliver chunks before delimiter buffering can bypass maxBytes.
+      splitMarker: ""
       onRead: function(data) { root.appendStdout(data) }
     }
     stderr: SplitParser {
+      splitMarker: ""
       onRead: function(data) { root.appendStderr(data) }
     }
+    onStarted: { root.onProcessStarted() }
+    onRunningChanged: { root.onProcessRunningChanged() }
     onExited: function(code, status) { root.onExited(code, status) }
   }
 
@@ -91,6 +98,7 @@ Item {
         String(Math.max(250, root.timeoutMs)), "--"].concat(cmd)
     deadline.interval = Math.max(250, root.timeoutMs)
     deadline.start()
+    root.startPendingData = true
     proc.running = true
   }
 
@@ -104,6 +112,8 @@ Item {
     exitCodeData = -1
     exitStatusData = -1
     finishedData = false
+    startPendingData = false
+    cancelPendingData = false
   }
 
   function utf8Length(text) {
@@ -140,8 +150,29 @@ Item {
   function appendStderr(data) { root.appendOutput(data, true) }
 
   function terminate() {
+    // Process.running includes QProcess startup, when its PID may still be 0.
+    // Defer signalling until started supplies a real process.
+    if (root.startPendingData) {
+      root.cancelPendingData = true
+      return
+    }
     if (proc.running) proc.signal(15)
     // Do not finish or cancel supervision while descendants are being cleaned.
+  }
+
+  function onProcessStarted() {
+    root.startPendingData = false
+    if (root.cancelPendingData) root.terminate()
+  }
+
+  function onProcessRunningChanged() {
+    // FailedToStart emits runningChanged(false), but no exited. Normal exits
+    // emit exited first; started clears this flag for a successfully launched
+    // relay. Ignore construction/idle notifications and never double-finish.
+    if (proc.running || !root.startPendingData || root.finishedData) return
+    root.startFailedData = true
+    deadline.stop()
+    root.finish()
   }
 
   function onExited(code, status) {
@@ -163,6 +194,8 @@ Item {
   function finish() {
     if (root.finishedData) return
     root.finishedData = true
+    root.startPendingData = false
+    root.cancelPendingData = false
     root.running = false
     root.finished()
   }
