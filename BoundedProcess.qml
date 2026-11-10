@@ -1,19 +1,10 @@
 import QtQuick
 import Quickshell.Io
 
-// BoundedProcess: runs `command` (an argv list) with the same lifecycle
-// guarantees as the backend run_cmd() helper:
-//   - stdout/stderr are collected incrementally (SplitParser) and hard-capped
-//     at maxBytes each; exceeding either cap kills the process group and is
-//     reported as overflow.
-//   - a wall-clock deadline (timeoutMs) fires SIGTERM then SIGKILL on the whole
-//     process group and is reported as a timeout; it never waits forever.
-//   - the command is launched through `setsid` so it becomes its own session /
-//     process-group leader; termination signals (including kill(1) on the
-//     negative pid) then reach every descendant, not just the direct child.
-// Usage mirrors Quickshell.Io.Process: set `command`, then `running = true`.
-// Rooted in an invisible Item (not QtObject) so the Process/Timer children can
-// attach to the default `data` property.
+// session_supervisor owns descendant cleanup, including after this component's
+// Process is hard-killed on reload/destruction. Its small tracked relay can die
+// without killing the cleanup worker. QML requests cancellation with SIGTERM;
+// only the supervisor escalates, and completion follows its cleanup attempt.
 Item {
   id: root
   visible: false
@@ -32,7 +23,6 @@ Item {
   readonly property bool timedOut: timedOutData
   readonly property bool overflowed: overflowedData
   readonly property bool startFailed: startFailedData
-
   readonly property bool success: finishedData && !startFailedData && !timedOutData
       && !overflowedData && exitStatusData === 0 && exitCodeData === 0
 
@@ -40,6 +30,7 @@ Item {
 
   property string stdoutData: ""
   property string stderrData: ""
+  property int capturedBytes: 0
   property bool timedOutData: false
   property bool overflowedData: false
   property bool startFailedData: false
@@ -49,13 +40,16 @@ Item {
 
   onRunningChanged: {
     if (root.running) {
-      // Defer until the component tree (proc, timers) is fully constructed so
-      // `running: true` in a declaration is safe.
+      // Defer until Process/Timer children are constructed.
       Qt.callLater(root.begin)
     } else if (!root.finishedData) {
       root.abort()
     }
   }
+
+  // Quickshell may immediately SIGKILL its tracked process during destruction.
+  // The supervisor's relay/worker parent-death protocol covers that race too.
+  Component.onDestruction: { if (proc.running) proc.signal(15) }
 
   Process {
     id: proc
@@ -75,38 +69,14 @@ Item {
     onTriggered: {
       if (root.running && !root.finishedData) {
         root.timedOutData = true
-        root.terminateGroup(false)
+        root.terminate()
       }
     }
   }
 
-  Timer {
-    id: hardKill
-    interval: 300
-    repeat: false
-    onTriggered: {
-      if (root.running && !root.finishedData) root.terminateGroup(true)
-    }
-  }
-
-  Timer {
-    id: killProcWatchdog
-    interval: 3000
-    repeat: false
-    onTriggered: {
-      if (killProc.running) killProc.signal(9)
-    }
-  }
-
-  Process {
-    id: killProc
-    stdout: SplitParser {}
-    stderr: SplitParser {}
-    onExited: killProcWatchdog.stop()
-  }
-
   function begin() {
-    if (!root.running) return
+    // Never reuse the tracked Process while an earlier cleanup is running.
+    if (!root.running || proc.running) return
     var cmd = root.command
     if (!cmd || cmd.length === 0) {
       root.reset()
@@ -115,9 +85,10 @@ Item {
       return
     }
     root.reset()
-    // Run under its own session so the launched command is its own
-    // process-group leader and a single group signal reaches every descendant.
-    proc.command = ["setsid"].concat(cmd)
+    var supervisor = decodeURIComponent(Qt.resolvedUrl("session_supervisor.py")
+        .toString().replace(/^file:\/\//, ""))
+    proc.command = ["python3", supervisor, "--timeout-ms",
+        String(Math.max(250, root.timeoutMs)), "--"].concat(cmd)
     deadline.interval = Math.max(250, root.timeoutMs)
     deadline.start()
     proc.running = true
@@ -126,77 +97,67 @@ Item {
   function reset() {
     stdoutData = ""
     stderrData = ""
+    capturedBytes = 0
     timedOutData = false
     overflowedData = false
     startFailedData = false
     exitCodeData = -1
     exitStatusData = -1
     finishedData = false
-    killProcWatchdog.stop()
-    if (killProc.running) killProc.running = false
   }
 
-  function appendStdout(data) {
+  function utf8Length(text) {
+    var bytes = 0
+    for (var i = 0; i < text.length; ++i) {
+      var code = text.charCodeAt(i)
+      if (code < 0x80) bytes += 1
+      else if (code < 0x800) bytes += 2
+      else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length
+          && text.charCodeAt(i + 1) >= 0xdc00 && text.charCodeAt(i + 1) <= 0xdfff) {
+        bytes += 4
+        ++i
+      } else bytes += 3
+    }
+    return bytes
+  }
+
+  function appendOutput(data, isStderr) {
     if (!root.running || root.finishedData || root.overflowedData) return
-    if (stdoutData.length < root.maxBytes) stdoutData += data
-    if (stdoutData.length >= root.maxBytes) {
+    var bytes = root.utf8Length(data)
+    // One aggregate UTF-8 budget. Never retain the overflowing chunk.
+    if (root.capturedBytes + bytes > Math.max(0, root.maxBytes)) {
       root.overflowedData = true
       deadline.stop()
-      root.terminateGroup(false)
-    }
-  }
-
-  function appendStderr(data) {
-    if (!root.running || root.finishedData || root.overflowedData) return
-    if (stderrData.length < root.maxBytes) stderrData += data
-    if (stderrData.length >= root.maxBytes) {
-      root.overflowedData = true
-      deadline.stop()
-      root.terminateGroup(false)
-    }
-  }
-
-  function terminateGroup(force) {
-    if (!proc.running) {
-      root.finish()
+      root.terminate()
       return
     }
-    if (force) {
-      // Hard kill: SIGKILL the leader directly and the whole group via
-      // kill(1) on its negative pid (leader PGID == its PID under setsid).
-      proc.signal(9)
-      var pid = Number(proc.processId)
-      if (pid > 0) {
-        killProc.command = ["kill", "-9", "-" + String(pid)]
-        killProcWatchdog.start()
-        killProc.running = true
-      }
-      root.finish()
-    } else {
-      // Gentle phase: SIGTERM the leader, then escalate to the hard kill.
-      proc.signal(15)
-      hardKill.start()
-    }
+    root.capturedBytes += bytes
+    if (isStderr) root.stderrData += data
+    else root.stdoutData += data
+  }
+
+  function appendStdout(data) { root.appendOutput(data, false) }
+  function appendStderr(data) { root.appendOutput(data, true) }
+
+  function terminate() {
+    if (proc.running) proc.signal(15)
+    // Do not finish or cancel supervision while descendants are being cleaned.
   }
 
   function onExited(code, status) {
-    if (!root.running || root.finishedData) return
+    if (root.finishedData) return
     deadline.stop()
-    hardKill.stop()
-    killProcWatchdog.stop()
-    if (killProc.running) killProc.running = false
     root.exitCodeData = code
     root.exitStatusData = status
+    if (code === 124) root.timedOutData = true
+    if (code === 125) root.startFailedData = true
     root.finish()
   }
 
   function abort() {
     deadline.stop()
-    hardKill.stop()
-    if (proc.running) proc.signal(9)
-    killProcWatchdog.stop()
-    if (killProc.running) killProc.running = false
-    root.finish()
+    if (proc.running) root.terminate()
+    else root.finish()
   }
 
   function finish() {
