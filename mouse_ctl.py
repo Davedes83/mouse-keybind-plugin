@@ -298,17 +298,21 @@ def run_cmd(cmd) -> tuple:
       - whole-process-group cleanup (SIGTERM -> SIGKILL + reap) on both
         overflow and timeout, so no child survives.
     Returns (returncode, bounded_stdout, bounded_stderr)."""
+    # process_group=0 gives each helper its own process group while retaining
+    # the caller's session.  session_supervisor.py therefore remains owner of
+    # the session and can clean it up without us creating an escaped session.
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        start_new_session=True,
+        process_group=0,
     )
     out = bytearray()
     err = bytearray()
     total = 0
     overflow = False
     timed_out = False
+    cleanup_attempted = False
     deadline = time.monotonic() + MAX_SUBPROCESS_TIMEOUT
     try:
         while True:
@@ -335,41 +339,112 @@ def run_cmd(cmd) -> tuple:
                     err += data
             if overflow:
                 break
+
         if timed_out or overflow:
+            cleanup_attempted = True
             _kill_and_reap(proc)
             if timed_out:
                 return 1, _decode(out), "command timed out"
             return 1, _decode(out), "command output limit exceeded"
-        code = proc.wait()
-        return code, _decode(out), _decode(err)
+
+        # Do not use Popen.wait() first here.  wait() reaps the leader, which
+        # releases the process-group ID for reuse before surviving descendants
+        # can be signalled.  waitid(WNOWAIT) observes its exit without reaping;
+        # _kill_and_reap then always clears the complete helper group.
+        if not _wait_for_exit_unreaped(proc, deadline):
+            cleanup_attempted = True
+            _kill_and_reap(proc)
+            return 1, _decode(out), "command timed out"
+        cleanup_attempted = True
+        # The leader has already exited (but remains unreaped to pin its PID).
+        # Kill any leftover group members immediately: no per-command TERM
+        # grace is needed on success, which keeps frequent status polls fast.
+        _kill_and_reap(proc, term_grace=0)
+        return proc.returncode, _decode(out), _decode(err)
     except Exception as exc:
-        _kill_and_reap(proc)
-        return 1, _decode(out), str(exc)
-
-
-def _kill_and_reap(proc):
-    """Terminate the whole process group (not just the leader), escalate to
-    SIGKILL, and reap so no child process survives."""
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-    try:
-        proc.wait(timeout=2)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-    try:
-        proc.wait(timeout=2)
-    except subprocess.TimeoutExpired:
+        # A failed cleanup must be visible and must not trigger a second group
+        # signal after its PID could theoretically have been reused.
+        if cleanup_attempted:
+            return 1, _decode(out), f"cleanup failed: {exc}"
+        cleanup_attempted = True
         try:
-            proc.wait()
-        except Exception:
+            _kill_and_reap(proc)
+        except Exception as cleanup_exc:
+            return 1, _decode(out), f"cleanup failed: {cleanup_exc}"
+        return 1, _decode(out), str(exc)
+    except BaseException:
+        # Preserve interrupts, but still make the best bounded cleanup attempt.
+        if not cleanup_attempted:
+            cleanup_attempted = True
+            _kill_and_reap(proc)
+        raise
+    finally:
+        # Also close on KeyboardInterrupt/SystemExit and other BaseException
+        # paths; leaving either descriptor open pins writers and descendants.
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except BaseException:
+                    pass
+
+
+def _wait_for_exit_unreaped(proc, deadline: float) -> bool:
+    """Wait until *proc* exits without reaping it, bounded by deadline.
+
+    Linux/Python 3.11 supplies waitid(WNOWAIT).  The fallback is only for
+    non-Linux platforms; the supported deployment uses the no-reap path.
+    """
+    waitid = getattr(os, "waitid", None)
+    wnowait = getattr(os, "WNOWAIT", 0)
+    if waitid is None or not wnowait:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            proc.wait(timeout=remaining)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+
+    options = os.WEXITED | os.WNOHANG | wnowait
+    while True:
+        info = waitid(os.P_PID, proc.pid, options)
+        if info is not None:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(remaining, 0.05))
+
+
+def _kill_and_reap(proc, term_grace=0.3):
+    """Clear proc's private helper group, then reap its leader within bounds.
+
+    The leader PID is also its process-group ID.  Never wait before SIGKILL:
+    even a leader that exits during TERM grace may have descendants left in its
+    group.  Permission and other unexpected signalling errors intentionally
+    propagate rather than reporting a successful cleanup.
+    """
+    group_id = proc.pid
+    for sig, grace in ((signal.SIGTERM, term_grace), (signal.SIGKILL, 0)):
+        try:
+            os.killpg(group_id, sig)
+        except ProcessLookupError:
             pass
+        except OSError as exc:
+            # ESRCH is the OSError form of ProcessLookupError on some builds;
+            # PermissionError and every other failure are actionable.
+            if exc.errno != errno.ESRCH:
+                raise
+        if grace:
+            time.sleep(grace)
+    try:
+        proc.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        # Never turn a bounded cleanup into an unbounded wait.  The caller
+        # receives a failure rather than a false success.
+        raise RuntimeError("helper leader did not reap within cleanup timeout")
 
 
 def _decode(data: bytearray) -> str:
