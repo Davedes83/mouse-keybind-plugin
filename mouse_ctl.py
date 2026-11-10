@@ -367,7 +367,8 @@ def run_cmd(cmd) -> tuple:
         if cleanup_attempted:
             return 1, _decode(out), f"cleanup failed: {exc}"
         cleanup_attempted = True
-        try:_kill_and_reap(proc)
+        try:
+            _kill_and_reap(proc)
         except Exception as cleanup_exc:
             return 1, _decode(out), f"cleanup failed: {cleanup_exc}"
         return 1, _decode(out), str(exc)
@@ -561,7 +562,8 @@ def get_devices():
         def _mouse_rank(name_l):
             if "mouse" in name_l:
                 return 0
-            if "keyboard" in name_l or "consumer" in name_l or "virtual" in name_l:return 2
+            if "keyboard" in name_l or "consumer" in name_l or "virtual" in name_l:
+                return 2
             return 1
         clean_mice.sort(key=lambda d: _mouse_rank(d["name"].lower()))
         return clean_mice
