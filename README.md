@@ -40,18 +40,16 @@ Because "just tweaking cursor speed real quick" shouldn't turn into a five-minut
 
 ## Installation
 
-Clone the repository into your user plugins directory and enable it:
-
-```bash
-git clone https://github.com/Davedes83/mouse-keybind-plugin \
-  ~/.config/omarchy/plugins/davedes.mouse-keybind-settings
-omarchy plugin add ~/.config/omarchy/plugins/davedes.mouse-keybind-settings --enable
-```
-
-Or install it directly from the repo URL:
+Install it directly from the repository URL (the standard marketplace path):
 
 ```bash
 omarchy plugin clone Davedes83/mouse-keybind-plugin --enable
+```
+
+Or register an existing checkout that already lives in your user plugins directory:
+
+```bash
+omarchy plugin add ~/.config/omarchy/plugins/davedes.mouse-keybind-settings --enable
 ```
 
 Afterwards restart the shell to load the widget:
@@ -64,22 +62,15 @@ omarchy restart shell
 
 The **button simulation** feature (test canvas / synthetic click) is **optional** and
 requires a separate, manual setup. It is not part of the base plugin installation and
-all mouse/keybind settings work without it. Missing `ydotool` disables only the
-simulate action — the plugin reports `ydotool not installed` and does nothing else.
+all mouse/keybind settings work without it. When `ydotool` is missing, the plugin only
+disables the simulate action — it reports `ydotool not installed` and changes nothing else.
 
-Set it up only if you want the synthetic-click helper:
-
-```bash
-# 1. Install the package (requires sudo, only needed if you want simulation)
-sudo pacman -S ydotool
-
-# 2. Activate the per-user service
-systemctl --user enable --now ydotool.service
-```
-
-Afterwards, the toolbar **Test Canvas** and the `simulate-button` CLI command emit
-synthetic clicks. If the socket is unavailable the plugin reports `ydotoold
-unavailable` — restart the service to re-enable it.
+The plugin itself installs no packages, requests no elevated privileges, and manages no
+system services. If you want the synthetic-click helper, provide the external `ydotool`
+package and its per-user daemon yourself using your normal package manager and
+user-service tooling. Once the `ydotoold` socket is available, the toolbar **Test Canvas**
+and the `simulate-button` CLI command emit synthetic clicks. If the socket is unavailable
+the plugin reports `ydotoold unavailable` — restart your daemon to re-enable it.
 
 ## Usage
 
