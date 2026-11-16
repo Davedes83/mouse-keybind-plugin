@@ -857,6 +857,11 @@ Item {
               id: searchInput
               anchors.fill: parent
               maximumLength: 256
+              // Mitigate Qt 6.12.0/Wayland automatic canPaste clipboard reads
+              // (malicious selection offer can trigger unbounded clipboard read
+              // before length limits apply). Sensitive hint reduces clipboard/IME
+              // probing.
+              inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText
               placeholderText: root.recordingSearch
                 ? "Listening... Press any shortcut combination (e.g. CTRL + O)"
                 : "Search shortcuts, actions, commands..."

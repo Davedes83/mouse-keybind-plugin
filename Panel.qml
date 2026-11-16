@@ -1705,6 +1705,11 @@ Panel {
             Layout.fillWidth: true
             Layout.preferredHeight: Style.space(36)
             maximumLength: 256
+            // Mitigate Qt 6.12.0/Wayland automatic canPaste clipboard reads
+            // (malicious selection offer can trigger unbounded clipboard read
+            // before length limits apply). Sensitive hint reduces clipboard/IME
+            // probing; manual paste remains available via shortcut handling.
+            inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText
             placeholderText: "Search shortcuts, actions, commands..."
             text: root.kbSearchQuery
             onTextChanged: root.kbSearchQuery = text

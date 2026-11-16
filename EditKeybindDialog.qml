@@ -600,6 +600,10 @@ Item {
               id: descInput
               Layout.fillWidth: true
               maximumLength: 200
+              // Mitigate Qt 6.12.0/Wayland automatic canPaste clipboard reads
+              // (malicious selection offer can trigger unbounded clipboard read
+              // before length limits apply).
+              inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText
               text: root.actionTitle
               placeholderText: "e.g. Launch Terminal, Toggle Fullscreen, My Script"
               onTextChanged: if (root.actionTitle !== text) root.actionTitle = text
@@ -624,6 +628,10 @@ Item {
               id: cmdInput
               Layout.fillWidth: true
               maximumLength: 2000
+              // Mitigate Qt 6.12.0/Wayland automatic canPaste clipboard reads
+              // (malicious selection offer can trigger unbounded clipboard read
+              // before length limits apply).
+              inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText
               text: root.actionCommand
               placeholderText: "e.g. alacritty -e btop, omarchy-capture-screenshot"
               onTextChanged: if (root.actionCommand !== text) root.actionCommand = text
